@@ -1,12 +1,12 @@
 /**
- * The Northwind MCP server, built on @dioschub/mcp-server.
+ * The Northwind MCP server, built on @intrigsoft/dioschub-mcp-server.
  *
  * Imported by the package NAME (not a relative src path) on purpose: this is
  * exactly how an external consumer would use the framework, so it also proves
  * the built `dist` + the package `exports` map actually work.
  */
-import { createMcpServer, type DioscMcpServer } from '@dioschub/mcp-server';
-import type { HubBinder, HubConfig } from '@dioschub/mcp-server';
+import { createMcpServer, type DioscMcpServer } from '@intrigsoft/dioschub-mcp-server';
+import type { HubBinder, HubConfig } from '@intrigsoft/dioschub-mcp-server';
 import { z } from 'zod';
 
 /** The Northwind app's native artifact: its session cookie header value. */

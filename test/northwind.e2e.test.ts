@@ -21,7 +21,7 @@ test('northwind end-to-end: framework fronts a real cookie-guarded backend', asy
   const backendServer = await listen(backend.app);
   const cookie = backend.login('ALFKI', 'ALFKI'); // the user's native session
 
-  // 2. The MCP server built on the framework (consumed as @dioschub/mcp-server).
+  // 2. The MCP server built on the framework (consumed as @intrigsoft/dioschub-mcp-server).
   const hub = capturingHub();
   const mcp = createNorthwindMcp({
     apiUrl: urlOf(backendServer),

@@ -1,9 +1,16 @@
 {
-  "name": "@dioschub/mcp-server",
+  "name": "@intrigsoft/dioschub-mcp-server",
   "version": "0.1.0",
   "description": "A TypeScript framework for building DioscHub-compatible MCP servers with Bring-Your-Own-Auth (BYOA) credential-blind pass-through.",
   "type": "module",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/intrigsoft/dioschub-mcp-server-node.git"
+  },
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com"
+  },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
@@ -19,6 +26,7 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "node --import tsx --test test/*.test.ts",
+    "prepack": "npm run build",
     "clean": "rm -rf dist"
   },
   "keywords": [

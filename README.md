@@ -1,4 +1,4 @@
-# @dioschub/mcp-server
+# @intrigsoft/dioschub-mcp-server
 
 A TypeScript framework for building **DioscHub-compatible MCP servers** with
 **Bring-Your-Own-Auth (BYOA)** credential-blind pass-through.
@@ -44,10 +44,27 @@ Two properties are non-negotiable and enforced by construction:
   clean `401`, which is exactly what trips the Hub's mid-turn re-auth so the kit
   re-binds. This is automatic.
 
+## Install
+
+Published to **GitHub Packages** (temporary home while npmjs is unavailable).
+Consumers need an `.npmrc` next to their `package.json`:
+
+```
+@intrigsoft:registry=https://npm.pkg.github.com
+//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}
+```
+
+`NODE_AUTH_TOKEN` must be a GitHub token with `read:packages` (GitHub Packages
+requires auth even for public npm packages). Then:
+
+```bash
+npm install @intrigsoft/dioschub-mcp-server
+```
+
 ## Quickstart
 
 ```ts
-import { createMcpServer, RedisArtifactStore } from '@dioschub/mcp-server';
+import { createMcpServer, RedisArtifactStore } from '@intrigsoft/dioschub-mcp-server';
 import { z } from 'zod';
 
 // Your app's artifact shape. The framework is blind to it; you own it.

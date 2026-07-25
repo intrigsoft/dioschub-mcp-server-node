@@ -1,6 +1,6 @@
 {
   "name": "@intrigsoft/dioschub-mcp-server",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A TypeScript framework for building DioscHub-compatible MCP servers with Bring-Your-Own-Auth (BYOA) credential-blind pass-through.",
   "type": "module",
   "license": "MIT",
@@ -42,8 +42,10 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.0",
     "express": "^5.0.0",
-    "jose": "^5.9.0",
-    "zod": "^3.23.8"
+    "jose": "^5.9.0"
+  },
+  "peerDependencies": {
+    "zod": "^3.23.8 || ^4.0.0"
   },
   "optionalDependencies": {
     "ioredis": "^5.4.0"
@@ -52,6 +54,7 @@
     "@types/express": "^5.0.0",
     "@types/node": "^20.14.0",
     "tsx": "^4.19.0",
-    "typescript": "^5.5.0"
+    "typescript": "^5.5.0",
+    "zod": "^4.4.3"
   }
 }

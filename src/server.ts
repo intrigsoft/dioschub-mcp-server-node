@@ -118,8 +118,14 @@ export function createMcpServer<TAuth = unknown>(
     let session: BoundSession<TAuth> | null = null;
 
     if (body?.method === 'tools/call') {
+      const tool = toolName(body);
       const token = bearer(req);
       if (!token) {
+        // The Hub sent no bearer. Almost always a Hub-side config issue: the MCP
+        // instance isn't a credential-less "conduit" (it has static authConfig), so
+        // the Hub drops the per-user handle instead of forwarding it. Logged because
+        // the wire answer (401) is otherwise silent and this is hard to diagnose.
+        logger.warn('tools/call rejected: no bearer token (is the Hub instance a conduit?)', { tool });
         unauthorized(res, 'missing_token');
         return;
       }
@@ -127,7 +133,17 @@ export function createMcpServer<TAuth = unknown>(
       let jti: string;
       try {
         ({ jti } = await verifyHandle(token, secrets, config.name));
-      } catch {
+      } catch (err) {
+        // Surface WHY the handle failed — wrong audience, expired, bad signature —
+        // by decoding (NOT verifying) its claims. This is the log that turns a
+        // silent, mystifying 401 into a one-line diagnosis. Safe: the handle-JWT
+        // carries only {jti, aud, exp}, never the native credential.
+        logger.warn('tools/call rejected: handle failed verification', {
+          tool,
+          expectedAud: config.name,
+          gotClaims: peekClaims(token),
+          error: (err as Error).message,
+        });
         unauthorized(res, 'invalid_token');
         return;
       }
@@ -136,7 +152,7 @@ export function createMcpServer<TAuth = unknown>(
       if (!session) {
         // Store miss: evicted, expired, or minted on a replica we can't see.
         // Distinguish for operators, but the wire answer is the same 401.
-        logger.info('unbound tool call', { reason: 'store_miss' });
+        logger.info('unbound tool call', { reason: 'store_miss', jti });
         unauthorized(res, 'unbound');
         return;
       }
@@ -219,6 +235,27 @@ function bearer(req: Request): string | undefined {
   if (!header) return undefined;
   const [scheme, value] = header.split(' ');
   return scheme?.toLowerCase() === 'bearer' && value ? value : undefined;
+}
+
+function toolName(body: unknown): string | undefined {
+  return (body as { params?: { name?: string } } | undefined)?.params?.name;
+}
+
+/**
+ * Decode — but do NOT verify — a token's JWT payload, for the auth-failure logs.
+ * Never used for authorization. Returns a short, non-secret claim summary so an
+ * operator can see what the Hub actually forwarded (e.g. a wrong `aud`, an expired
+ * `exp`, or a non-JWT string from a misconfigured static authConfig).
+ */
+function peekClaims(token: string): string {
+  try {
+    const payload = token.split('.')[1];
+    if (!payload) return '<not-a-jwt>';
+    const json = Buffer.from(payload, 'base64url').toString('utf8');
+    return json.length > 200 ? json.slice(0, 200) + '…' : json;
+  } catch {
+    return '<unparseable>';
+  }
 }
 
 function unauthorized(res: Response, code: string): void {

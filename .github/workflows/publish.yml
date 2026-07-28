@@ -13,6 +13,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      id-token: write # OIDC identity for npm Trusted Publishing (no stored token)
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -21,6 +22,8 @@ jobs:
           registry-url: 'https://registry.npmjs.org'
           scope: '@dioschub'
           cache: npm
+      # Trusted Publishing (OIDC) needs npm >= 11.5.1; node 20 ships 10.x.
+      - run: npm install -g npm@latest
       - run: npm ci
       - run: npm run build
       - run: npm test
@@ -37,9 +40,9 @@ jobs:
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
-      # publishConfig.access=public makes the first scoped publish public.
-      - name: Publish to npm
+      # No NODE_AUTH_TOKEN: npm >= 11.5.1 exchanges the GitHub OIDC token for a
+      # short-lived publish credential via the package's Trusted Publisher config.
+      # publishConfig.access=public keeps the scoped package public.
+      - name: Publish to npm (Trusted Publishing / OIDC)
         if: steps.check.outputs.skip == 'false'
         run: npm publish
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

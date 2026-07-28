@@ -22,8 +22,9 @@ jobs:
           registry-url: 'https://registry.npmjs.org'
           scope: '@dioschub'
           cache: npm
-      # Trusted Publishing (OIDC) needs npm >= 11.5.1; node 20 ships 10.x.
-      - run: npm install -g npm@latest
+      # Trusted Publishing (OIDC) needs npm >= 11.5.1; node 20 ships 10.x. Pin to
+      # npm@11 (latest is 12.x, which requires node >= 22).
+      - run: npm install -g npm@11
       - run: npm ci
       - run: npm run build
       - run: npm test

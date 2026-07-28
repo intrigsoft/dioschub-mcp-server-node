@@ -1,8 +1,11 @@
 name: Publish
 
+# What is on the `production` branch is what is published. Bump the version on
+# `main`, merge to `production`, and CI publishes it. Re-pushing production
+# without a version bump is a safe no-op (the guard below skips the publish).
 on:
   push:
-    tags: ['v*']
+    branches: [production]
   workflow_dispatch:
 
 jobs:
@@ -10,18 +13,33 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
-          registry-url: 'https://npm.pkg.github.com'
-          scope: '@intrigsoft'
+          registry-url: 'https://registry.npmjs.org'
+          scope: '@dioschub'
           cache: npm
       - run: npm ci
       - run: npm run build
       - run: npm test
-      - run: npm publish
+      # Skip the publish if this exact version is already on npm, so a push to
+      # production without a version bump does not fail on "cannot republish".
+      - name: Is this version already published?
+        id: check
+        run: |
+          NAME=$(node -p "require('./package.json').name")
+          VERSION=$(node -p "require('./package.json').version")
+          if npm view "$NAME@$VERSION" version >/dev/null 2>&1; then
+            echo "already $NAME@$VERSION is on npm — skipping publish"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+      # publishConfig.access=public makes the first scoped publish public.
+      - name: Publish to npm
+        if: steps.check.outputs.skip == 'false'
+        run: npm publish
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

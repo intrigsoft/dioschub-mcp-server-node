@@ -70,6 +70,25 @@ export interface HubConfig {
   bindPath?: string;
   /** Header the Hub expects the API key in. Default: `x-api-key`. */
   apiKeyHeader?: string;
+  /**
+   * This server's MCP instance name **as registered in the Hub** (the name on
+   * the Hub's Servers page). The Hub keys per-target credentials by it, so it
+   * must match exactly.
+   *
+   * Why it matters: without a per-target key the Hub stores our handle
+   * session-wide and replays it to *every* credential-less MCP instance the
+   * assistant has attached — so a handle minted for this server is handed to
+   * unrelated servers too. Naming ourselves lets the Hub forward it to us
+   * alone.
+   *
+   * Defaults to the framework's `name`, which is correct whenever the Hub
+   * instance was registered under the same name (the usual case). Override it
+   * when they differ.
+   *
+   * A Hub that predates per-target binding ignores this and falls back to the
+   * session-wide behaviour, so setting it is always safe.
+   */
+  instanceName?: string;
 }
 
 export interface CreateMcpServerConfig<TAuth> {

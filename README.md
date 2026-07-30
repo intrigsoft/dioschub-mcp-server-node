@@ -32,10 +32,18 @@ TOOL CALL  (every call)
 
 Two properties are non-negotiable and enforced by construction:
 
-- **Credential-blind.** We hand the Hub only the handle-JWT (placed in
-  `authArtifacts.headers.Authorization`). It carries a random `jti`, an audience,
-  and an expiry — never the credentials. The Hub replays that handle back to us
-  on each tool call; native artifacts live only on the MCP server, keyed by `jti`.
+- **Credential-blind.** We hand the Hub only the handle-JWT. It carries a random
+  `jti`, an audience, and an expiry — never the credentials. The Hub replays that
+  handle back to us on each tool call; native artifacts live only on the MCP
+  server, keyed by `jti`.
+- **Audience-bound, and scoped to us on the wire.** The handle's `aud` means no
+  other server can *use* it. Whether another server ever *sees* it is the Hub's
+  forwarding decision: bound session-wide, the Hub replays it to every conduit
+  instance on the assistant, so an unrelated MCP server receives a live
+  credential for this one. So the bind names its target — the handle goes into
+  `authArtifacts.perServer[instanceName]`, and the Hub gives unnamed instances
+  no credentials at all. Set `hub.instanceName` if your Hub instance name
+  differs from `name`.
 - **Conduit instance required.** The Hub forwards per-user BYOA headers ONLY to
   MCP instances configured *without* static server auth. Attach this server as a
   credential-less ("conduit") instance, or the handle is dropped and tool calls
@@ -96,7 +104,7 @@ server.listen(8080, () => process.stderr.write('northwind-mcp on :8080\n'));
 | `name`        | yes      | Server name; also the JWT audience.                                   |
 | `adminKey`    | yes      | Authenticates the app's `/bind` call. Must be an **admin** key.       |
 | `jwtSecrets`  | yes      | HS256 secret, or an array (first signs, all verify → zero-downtime rotation). |
-| `hub`         | yes*     | `{ url, apiKey, bindPath?, apiKeyHeader? }`. `apiKey` = a `diosc_ak_…` admin key scoped `auth:bind`. Default path `/api/auth/bind`, header `x-api-key`. |
+| `hub`         | yes*     | `{ url, apiKey, bindPath?, apiKeyHeader?, instanceName? }`. `apiKey` = a `diosc_ak_…` admin key scoped `auth:bind`. Default path `/api/auth/bind`, header `x-api-key`. `instanceName` = this server's **Hub instance name**, used to scope the handle to us; defaults to `name`, must match the Hub exactly. |
 | `hubClient`   | yes*     | \*Provide `hub` **or** `hubClient` (a custom `HubBinder`).            |
 | `store`       | no       | `MemoryArtifactStore` (default) or `RedisArtifactStore`.              |
 | `ttlSeconds`  | no       | Session + JWT lifetime. Default `28800` (8h).                         |
@@ -124,6 +132,11 @@ To make this server's tools reachable by an assistant's LLM:
    { "name": "my-server", "serverUrl": "http://host:8080/mcp",
      "transportType": "http", "authConfig": {}, "isActive": true }
    ```
+   The instance `name` here is what scopes your handle. It must equal the
+   framework's `name` — or `hub.instanceName`, if you set it. A mismatch means
+   the Hub forwards no credentials to you and every tool call arrives
+   unauthenticated (the Hub logs `BYOA: forwarding no user credentials to MCP
+   instance "…"` naming the instance it expected).
 2. **Attach it to an assistant**: `PUT /api/admin/assistants/:id` with
    `attachedMcpServers: ["my-server", …]` (replaces the whole set).
 3. **Restart the Hub.** The Hub scans MCP providers into its tool graph **at boot

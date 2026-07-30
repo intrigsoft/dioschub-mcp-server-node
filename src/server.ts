@@ -45,7 +45,11 @@ export function createMcpServer<TAuth = unknown>(
   const hub: HubBinder =
     config.hubClient ??
     (config.hub
-      ? new HubClient(config.hub, logger)
+      ? // Default the Hub instance name to this server's name so per-target
+        // binding works out of the box: the handle is minted with `aud: name`,
+        // and the Hub instance is conventionally registered under the same name.
+        // Operators whose Hub instance name differs override `hub.instanceName`.
+        new HubClient({ instanceName: config.name, ...config.hub }, logger)
       : (() => {
           throw new Error('createMcpServer requires either `hub` config or a `hubClient`');
         })());

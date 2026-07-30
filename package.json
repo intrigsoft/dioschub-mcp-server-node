@@ -1,6 +1,6 @@
 {
   "name": "@dioschub/mcp-server",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "description": "A TypeScript framework for building DioscHub-compatible MCP servers with Bring-Your-Own-Auth (BYOA) credential-blind pass-through.",
   "type": "module",
   "license": "MIT",

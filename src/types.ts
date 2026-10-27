@@ -2,6 +2,8 @@ import type { z } from 'zod';
 import type { ArtifactStore } from './store/artifact-store.js';
 import type { Logger } from './logger.js';
 import type { HubBinder } from './hub-client.js';
+import type { ToolAnnotations } from '@modelcontextprotocol/sdk/types.js';
+import type { IdempotencyConfig } from './idempotency/index.js';
 
 /**
  * A bound session: the opaque native auth artifacts the app handed us at /bind,
@@ -41,6 +43,12 @@ export interface ToolDefinition<
   description?: string;
   /** A `z.object({...})` describing the business parameters. Omit for no-arg tools. */
   input?: Schema;
+  /**
+   * MCP tool annotations (`title`, `readOnlyHint`, `destructiveHint`,
+   * `idempotentHint`, `openWorldHint`), listed unchanged in `tools/list`.
+   * No defaults are invented: omit them and none are listed.
+   */
+  annotations?: ToolAnnotations;
   /**
    * The handler. Return plain data — the framework wraps it into an MCP
    * CallToolResult. Return an object with a `content` array to take full control.
@@ -136,4 +144,14 @@ export interface CreateMcpServerConfig<TAuth> {
    * Default: on unless NODE_ENV === 'production'.
    */
   devGuard?: boolean;
+
+  /**
+   * Duplicate-call protection. On by default: a `tools/call` carrying
+   * `params._meta["dioschub/idempotencyKey"]` runs its handler once per
+   * (connection, tool, key); duplicates get the first call's result. The
+   * `dioschub/idempotency` capability is advertised on initialize. Pass `false`
+   * to turn it off (no capability, no dedup). Use a `RedisIdempotencyStore`
+   * for more than one replica.
+   */
+  idempotency?: false | IdempotencyConfig;
 }

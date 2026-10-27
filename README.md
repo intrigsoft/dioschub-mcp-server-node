@@ -110,6 +110,80 @@ server.listen(8080, () => process.stderr.write('northwind-mcp on :8080\n'));
 | `ttlSeconds`  | no       | Session + JWT lifetime. Default `28800` (8h).                         |
 | `basePath`    | no       | Mount prefix for `/bind` and `/mcp`.                                  |
 | `devGuard`    | no       | Scan tool results for leaked artifacts. Default on outside production.|
+| `idempotency` | no       | `false` to disable, or `{ store?, ttlSeconds?, waitMs? }`. On by default (see *Idempotency*). |
+
+## Tool annotations
+
+A tool may carry MCP `annotations` (`title`, `readOnlyHint`, `destructiveHint`,
+`idempotentHint`, `openWorldHint`). They appear unchanged on that tool in
+`tools/list`; a tool without them lists none (no defaults are invented). (ANN-001)
+
+```ts
+server.tool({
+  name: 'delete_order',
+  annotations: { destructiveHint: true, idempotentHint: false },
+  input: z.object({ id: z.string() }),
+  handler: async ({ id }, ctx) => { /* … */ },
+});
+```
+
+## Idempotency
+
+A client (the Hub) can mark a `tools/call` with a key so a retry never runs a
+side effect twice.
+
+- **Capability (IDEM-001).** `initialize` returns
+  `capabilities.experimental["dioschub/idempotency"] = { version: 1 }`. With
+  `idempotency: false` it is absent and no dedup runs.
+- **Key (IDEM-002).** `params._meta["dioschub/idempotencyKey"]` of `tools/call`.
+  No key: the handler runs every time. A key that is not a non-empty string of
+  at most 256 characters gets `INVALID_IDEMPOTENCY_KEY` and the handler does not run.
+- **Seen and finished (IDEM-003).** A later call with the same key returns the
+  first call's result unchanged (`content`, `structuredContent`, `isError`) and
+  the handler does not run. Arguments are not compared: the key identifies the call.
+  A handler that throws or returns `isError: true` is finished too; its error is
+  cached and replayed, never re-run.
+- **Seen and still running (IDEM-004).** A duplicate waits up to `waitMs`
+  (default 30000). If the first call finishes in time it gets that result;
+  otherwise it gets, and the handler is not run:
+  ```json
+  { "isError": true,
+    "content": [{ "type": "text", "text": "<the JSON below>" }],
+    "structuredContent": { "success": false, "code": "IN_PROGRESS",
+      "message": "the call with this idempotency key is still running; its outcome is not known yet" } }
+  ```
+  `INVALID_IDEMPOTENCY_KEY` has the same shape. A late completion still lands in
+  the entry, so the next duplicate gets the real result.
+- **Scope (IDEM-005).** An entry is keyed by the verified session's
+  `connectionId` + tool name + key. The connection comes from the verified handle,
+  never from the request body. Another connection or another tool never sees it.
+  Auth runs first: an unauthenticated call gets 401 and creates no entry.
+- **Atomic claim (IDEM-006).** Of N concurrent calls with one scope and key,
+  exactly one runs the handler.
+- **Stores (IDEM-007).** `MemoryIdempotencyStore` (default, one process) or
+  `RedisIdempotencyStore({ url | client, keyPrefix? })` (claim is `SET … NX EX`;
+  default prefix `diosc:mcp:idem:`). Entries, running and done, expire after
+  `ttlSeconds` (default 3600).
+- **Credential blind (IDEM-008).** Entry keys are a hash of the scope, and
+  entries hold no bearer token and no auth artifacts of their own: only the
+  handler's result (or a thrown handler's error message) is stored. The dev
+  guard logs a result that echoes the artifacts but does not redact it, so a
+  handler that leaks a credential into its result leaks it into the store too.
+
+```ts
+createMcpServer({
+  /* … */
+  idempotency: { store: new RedisIdempotencyStore({ url: process.env.REDIS_URL }), waitMs: 30_000 },
+});
+```
+
+Limits: if a process dies mid-call, its key keeps answering `IN_PROGRESS` until
+the TTL expires (the call may have run, so it is never re-run). Results are
+stored as JSON, so a result must be JSON-serializable. A handler's own side
+effects are not rolled back; this only prevents a second run. A handler that
+runs longer than `ttlSeconds` outlives its entry: a duplicate after the expiry
+runs it again, and whichever run finishes last writes the entry. Set
+`ttlSeconds` well above your longest handler run and above `waitMs`.
 
 ## Routes the framework owns
 
@@ -154,6 +228,10 @@ To make this server's tools reachable by an assistant's LLM:
 Use `RedisArtifactStore` for more than one replica: a JWT minted on replica A
 must resolve on replica B. `MemoryArtifactStore` is single-instance only — after
 a restart, every user re-binds (correctly, via the 401 path, but visibly).
+
+Idempotency needs the same: with more than one replica pass
+`idempotency: { store: new RedisIdempotencyStore(...) }`, or a duplicate that
+lands on another replica runs the handler again.
 
 ## Status
 

@@ -22,4 +22,13 @@ export type {
   RedisLike,
 } from './store/index.js';
 
+export { MemoryIdempotencyStore, RedisIdempotencyStore } from './idempotency/index.js';
+export type {
+  IdempotencyConfig,
+  IdempotencyEntry,
+  IdempotencyRedisLike,
+  IdempotencyStore,
+  RedisIdempotencyStoreOptions,
+} from './idempotency/index.js';
+
 export { HubBindError } from './hub-client.js';

@@ -18,7 +18,18 @@ import type { ArtifactStore } from './store/artifact-store.js';
 import { signHandle, verifyHandle } from './jwt.js';
 import { HubClient, type HubBinder } from './hub-client.js';
 import { requestContext, type RequestContext } from './context.js';
-import { assertNoArtifactLeak, toCallToolResult } from './result.js';
+import { assertNoArtifactLeak, toCallToolResult, type CallToolResult } from './result.js';
+import {
+  DEFAULT_IDEMPOTENCY_TTL_SECONDS,
+  DEFAULT_IDEMPOTENCY_WAIT_MS,
+  IDEMPOTENCY_CAPABILITY,
+  IDEMPOTENCY_META_KEY,
+  MemoryIdempotencyStore,
+  codedError,
+  idempotencyScope,
+  isValidIdempotencyKey,
+  runDeduplicated,
+} from './idempotency/index.js';
 
 const DEFAULT_TTL_SECONDS = 8 * 60 * 60;
 
@@ -53,6 +64,17 @@ export function createMcpServer<TAuth = unknown>(
       : (() => {
           throw new Error('createMcpServer requires either `hub` config or a `hubClient`');
         })());
+
+  // The cache lives here, on the instance (or its store): buildMcpServer() makes a
+  // fresh McpServer per request, so nothing request-scoped can hold dedup state.
+  const idem =
+    config.idempotency === false
+      ? undefined
+      : {
+          store: config.idempotency?.store ?? new MemoryIdempotencyStore(),
+          ttlSeconds: config.idempotency?.ttlSeconds ?? DEFAULT_IDEMPOTENCY_TTL_SECONDS,
+          waitMs: config.idempotency?.waitMs ?? DEFAULT_IDEMPOTENCY_WAIT_MS,
+        };
 
   const base = (config.basePath ?? '').replace(/\/+$/, '');
   const bindPath = base + '/bind';
@@ -184,7 +206,12 @@ export function createMcpServer<TAuth = unknown>(
 
   // Build a fresh MCP server per request (connect-per-call) with all tools.
   function buildMcpServer(): McpServer {
-    const server = new McpServer({ name: config.name, version: config.version ?? '0.0.0' });
+    const server = new McpServer(
+      { name: config.name, version: config.version ?? '0.0.0' },
+      idem
+        ? { capabilities: { experimental: { [IDEMPOTENCY_CAPABILITY]: { version: 1 } } } }
+        : undefined,
+    );
     for (const def of tools) registerTool(server, def);
     return server;
   }
@@ -200,22 +227,63 @@ export function createMcpServer<TAuth = unknown>(
         title: def.title,
         description: def.description,
         inputSchema: inputShape,
+        ...(def.annotations ? { annotations: def.annotations } : {}),
       },
-      async (args: Record<string, unknown>, extra: { signal: AbortSignal }) => {
+      async (
+        args: Record<string, unknown>,
+        extra: { signal: AbortSignal; _meta?: Record<string, unknown> },
+      ) => {
         const rc = requestContext.getStore() as RequestContext<TAuth> | undefined;
         if (!rc?.session) {
           // Belt-and-braces: the HTTP layer already gated tools/call.
           throw new Error('unauthenticated tool invocation');
         }
+        const session = rc.session;
         const ctx: ToolContext<TAuth> = {
-          auth: rc.session.artifacts,
-          connectionId: rc.session.connectionId,
-          logger: logger.child({ tool: def.name, connectionId: rc.session.connectionId }),
+          auth: session.artifacts,
+          connectionId: session.connectionId,
+          logger: logger.child({ tool: def.name, connectionId: session.connectionId }),
           signal: extra.signal,
         };
-        const result = await def.handler(args as never, ctx);
-        if (devGuard) assertNoArtifactLeak(result, rc.session.artifacts, ctx.logger);
-        return toCallToolResult(result);
+        const run = async (): Promise<CallToolResult> => {
+          const result = await def.handler(args as never, ctx);
+          if (devGuard) assertNoArtifactLeak(result, session.artifacts, ctx.logger);
+          return toCallToolResult(result);
+        };
+
+        const meta = extra._meta;
+        if (!idem || !meta || !Object.prototype.hasOwnProperty.call(meta, IDEMPOTENCY_META_KEY)) {
+          return run();
+        }
+        const key = meta[IDEMPOTENCY_META_KEY];
+        if (!isValidIdempotencyKey(key)) {
+          return codedError(
+            'INVALID_IDEMPOTENCY_KEY',
+            `${IDEMPOTENCY_META_KEY} must be a non-empty string of at most 256 characters`,
+          );
+        }
+        // Scope = verified session's connectionId + tool + key (never from the body).
+        return runDeduplicated(
+          idem.store,
+          idempotencyScope(session.connectionId, def.name, key),
+          {
+            ttlSeconds: idem.ttlSeconds,
+            waitMs: idem.waitMs,
+            signal: extra.signal,
+            onStoreError: (err) =>
+              ctx.logger.error('idempotency: could not record the finished result', {
+                error: (err as Error).message,
+              }),
+          },
+          // A failure is a finished call: cache the error result, never re-run.
+          () =>
+            run().catch(
+              (err: unknown): CallToolResult => ({
+                isError: true,
+                content: [{ type: 'text', text: err instanceof Error ? err.message : String(err) }],
+              }),
+            ),
+        );
       },
     );
   }

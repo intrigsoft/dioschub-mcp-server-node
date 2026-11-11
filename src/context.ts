@@ -10,6 +10,13 @@ import type { BoundSession } from './types.js';
 export interface RequestContext<TAuth> {
   /** Null for non-tool requests (initialize, tools/list) that need no auth. */
   session: BoundSession<TAuth> | null;
+  /** The verified handle's jti, so a handler's ReauthRequired can drop the session. */
+  jti: string | null;
+  /**
+   * Set when a handler threw ReauthRequired. The HTTP layer then answers 401
+   * instead of the transport's tool result.
+   */
+  reauth?: { tool: string; message: string };
 }
 
 export const requestContext = new AsyncLocalStorage<RequestContext<unknown>>();

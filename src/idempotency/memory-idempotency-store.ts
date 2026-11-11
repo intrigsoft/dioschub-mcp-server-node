@@ -43,4 +43,8 @@ export class MemoryIdempotencyStore implements IdempotencyStore {
       expiresAt: Date.now() + ttlSeconds * 1000,
     });
   }
+
+  async release(scope: string): Promise<void> {
+    this.entries.delete(scope);
+  }
 }

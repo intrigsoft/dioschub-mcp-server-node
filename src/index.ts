@@ -4,6 +4,7 @@ export type { DioscMcpServer } from './server.js';
 export type {
   BindIdentity,
   BoundSession,
+  CallContext,
   CreateMcpServerConfig,
   HubConfig,
   ToolContext,
@@ -32,3 +33,5 @@ export type {
 } from './idempotency/index.js';
 
 export { HubBindError } from './hub-client.js';
+
+export { ReauthRequired } from './errors.js';

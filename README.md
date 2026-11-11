@@ -51,6 +51,10 @@ Two properties are non-negotiable and enforced by construction:
 - **Store miss → 401, never 500.** A missing/expired/evicted session returns a
   clean `401`, which is exactly what trips the Hub's mid-turn re-auth so the kit
   re-binds. This is automatic.
+- **Upstream refusal → 401 too, if you say so.** When your app rejects the bound
+  credential before its natural expiry (logout, revocation), throw
+  `ReauthRequired` from the handler and the call ends the same way. See
+  *Credential rejected mid-session*.
 
 ## Install
 
@@ -96,6 +100,71 @@ server.tool({
 
 server.listen(8080, () => process.stderr.write('northwind-mcp on :8080\n'));
 ```
+
+## The tool context
+
+A handler's second argument:
+
+| Field          | What it is |
+| -------------- | ---------- |
+| `auth`         | The artifacts the app sent at `/bind`, verbatim. |
+| `connectionId` | The Hub connection the call is bound to. |
+| `call`         | The Hub's call context from `_meta`: `currentPath` (the page the user was on when the turn started), `userId`, `tenantId`, `sessionId`, `threadId`. Each is optional. |
+| `meta`         | The call's raw `_meta`, read-only, for keys `call` does not model. |
+| `logger`       | Scoped to this tool and connection; never logs `auth`. |
+| `signal`       | Aborts when the caller disconnects. |
+
+`ctx.call` lets a tool resolve "the patient on screen" without the model having
+to repeat an id:
+
+```ts
+handler: async (_args, ctx) => {
+  const id = ctx.call.currentPath?.match(/^\/patients\/([^/?#]+)/)?.[1];
+  if (!id) return { error: 'Open a patient first.' };
+  // Still an upstream call with the user's own credential: the app decides access.
+  const res = await fetch(`${API}/patients/${id}`, { headers: { cookie: ctx.auth.sessionCookie } });
+  return res.json();
+},
+```
+
+`call` and `meta` arrive in the request body. They are hints for what the user
+means, **never authorization**: always fetch with `ctx.auth`, so the upstream
+app checks access. `currentPath` is the page when the turn started; it is not
+updated if the user navigates while the turn runs.
+
+## Credential rejected mid-session
+
+The session in the store normally lasts `ttlSeconds`. If your app rejects the
+credential earlier (the user logged out and back in, a token was revoked), throw
+`ReauthRequired` from the handler:
+
+```ts
+import { ReauthRequired } from '@dioschub/mcp-server';
+
+handler: async (args, ctx) => {
+  const res = await fetch(url, { headers: { authorization: `Bearer ${ctx.auth.token}` } });
+  if (res.status === 401) throw new ReauthRequired('upstream returned 401');
+  return res.json();
+},
+```
+
+The framework then:
+
+1. drops the bound session, so the stale credential is never used again;
+2. answers the call with HTTP `401` (`code: "reauth_required"`) instead of a tool
+   result. The Hub treats a 401 as *not sent*: it asks the host app to re-bind
+   and sends the same call again with the fresh credential;
+3. releases the call's idempotency entry, so that retry (same key) runs instead
+   of replaying the refusal.
+
+Because the Hub runs the call again, throw `ReauthRequired` only when the
+upstream refused the request **before anything changed**. If a multi-step
+handler already wrote something, return an ordinary error. Any other thrown
+error stays a normal tool error and leaves the session bound. The error message
+is logged on this server only.
+
+With this, you no longer need to match `ttlSeconds` to your credential's
+lifetime to get a clean re-bind: expiry and early rejection both end in one.
 
 ## Configuration
 
@@ -163,7 +232,9 @@ side effect twice.
 - **Stores (IDEM-007).** `MemoryIdempotencyStore` (default, one process) or
   `RedisIdempotencyStore({ url | client, keyPrefix? })` (claim is `SET … NX EX`;
   default prefix `diosc:mcp:idem:`). Entries, running and done, expire after
-  `ttlSeconds` (default 3600).
+  `ttlSeconds` (default 3600). A custom store should implement `release(scope)`
+  (delete the entry); without it, the retry after a `ReauthRequired` gets
+  `IN_PROGRESS` until the entry expires.
 - **Credential blind (IDEM-008).** Entry keys are a hash of the scope, and
   entries hold no bearer token and no auth artifacts of their own: only the
   handler's result (or a thrown handler's error message) is stored. The dev
@@ -191,7 +262,9 @@ runs it again, and whichever run finishes last writes the entry. Set
   `{ connectionId, artifacts, identity? }`. `connectionId` is the Hub `wsId`
   (surfaced by the kit on `bind:ready`); `identity` is optional non-credential
   metadata forwarded to the Hub (`{ userId, username, role:{id,name} }`).
-- `POST {basePath}/mcp` — the MCP endpoint (streamable HTTP, stateless / connect-per-call).
+- `POST {basePath}/mcp` — the MCP endpoint (streamable HTTP, stateless / connect-per-call,
+  JSON responses: the reply is written once the handler finishes, so a handler can
+  still turn it into a 401).
 
 Mount your own routes (health, readiness) on `server.app`.
 

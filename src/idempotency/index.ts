@@ -58,17 +58,36 @@ export const IN_PROGRESS_MESSAGE =
 /**
  * Run `execute` at most once per scope. `execute` must not throw (it returns an
  * error result instead), so a failure is a finished call, never a re-run.
+ *
+ * The one exception is `opts.released()`: when it returns true after `execute`,
+ * the call did not happen (the upstream refused the credential) and the Hub
+ * will send it again after a re-bind, so the entry is removed, not completed.
  */
 export async function runDeduplicated(
   store: IdempotencyStore,
   scope: string,
-  opts: { ttlSeconds: number; waitMs: number; signal?: AbortSignal; onStoreError?: (err: unknown) => void },
+  opts: {
+    ttlSeconds: number;
+    waitMs: number;
+    signal?: AbortSignal;
+    onStoreError?: (err: unknown) => void;
+    released?: () => boolean;
+  },
   execute: () => Promise<CallToolResult>,
 ): Promise<CallToolResult> {
   const deadline = Date.now() + opts.waitMs;
   for (;;) {
     if (await store.claim(scope, opts.ttlSeconds)) {
       const result = await execute();
+      if (opts.released?.()) {
+        try {
+          if (!store.release) throw new Error('the idempotency store has no release(); the retry will get IN_PROGRESS until the entry expires');
+          await store.release(scope);
+        } catch (err) {
+          opts.onStoreError?.(err);
+        }
+        return result;
+      }
       try {
         await store.complete(scope, result, opts.ttlSeconds);
       } catch (err) {

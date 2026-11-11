@@ -3,11 +3,12 @@ import type { Server } from 'node:http';
 import express, { type Express, type Request, type Response } from 'express';
 import { z } from 'zod';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js';
 
 import type {
   BindIdentity,
   BoundSession,
+  CallContext,
   CreateMcpServerConfig,
   ToolContext,
   ToolDefinition,
@@ -18,6 +19,7 @@ import type { ArtifactStore } from './store/artifact-store.js';
 import { signHandle, verifyHandle } from './jwt.js';
 import { HubClient, type HubBinder } from './hub-client.js';
 import { requestContext, type RequestContext } from './context.js';
+import { ReauthRequired } from './errors.js';
 import { assertNoArtifactLeak, toCallToolResult, type CallToolResult } from './result.js';
 import {
   DEFAULT_IDEMPOTENCY_TTL_SECONDS,
@@ -142,6 +144,7 @@ export function createMcpServer<TAuth = unknown>(
   app.post(mcpPath, async (req: Request, res: Response) => {
     const body = req.body as { method?: string } | undefined;
     let session: BoundSession<TAuth> | null = null;
+    let jti: string | null = null;
 
     if (body?.method === 'tools/call') {
       const tool = toolName(body);
@@ -156,7 +159,6 @@ export function createMcpServer<TAuth = unknown>(
         return;
       }
 
-      let jti: string;
       try {
         ({ jti } = await verifyHandle(token, secrets, config.name));
       } catch (err) {
@@ -184,16 +186,41 @@ export function createMcpServer<TAuth = unknown>(
       }
     }
 
+    // JSON-response mode: the transport answers only once the handler has
+    // finished, so a handler's ReauthRequired can still become an HTTP 401.
     const server = buildMcpServer();
-    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
-    res.on('close', () => {
-      transport.close().catch(() => undefined);
-      server.close().catch(() => undefined);
+    const transport = new WebStandardStreamableHTTPServerTransport({
+      sessionIdGenerator: undefined,
+      enableJsonResponse: true,
+    });
+    // A caller that hangs up aborts the handler (ctx.signal); nothing is written.
+    const closed = new Promise<null>((resolve) => {
+      res.on('close', () => {
+        transport.close().catch(() => undefined);
+        server.close().catch(() => undefined);
+        resolve(null);
+      });
     });
 
-    const rc: RequestContext<TAuth> = { session };
+    const rc: RequestContext<TAuth> = { session, jti };
     await server.connect(transport);
-    await requestContext.run(rc, () => transport.handleRequest(req, res, body));
+    const reply = await Promise.race([
+      requestContext.run(rc, () => transport.handleRequest(toWebRequest(req), { parsedBody: body })),
+      closed,
+    ]);
+    if (reply === null || res.headersSent) return;
+
+    if (rc.reauth) {
+      // The upstream refused the credential: same wire answer as a store miss,
+      // so the Hub re-binds and sends this call again.
+      logger.info('tool asked for re-bind', { reason: 'upstream_rejected', ...rc.reauth });
+      unauthorized(res, 'reauth_required');
+      return;
+    }
+
+    res.status(reply.status);
+    reply.headers.forEach((value, name) => res.setHeader(name, value));
+    res.end(Buffer.from(await reply.arrayBuffer()));
   });
 
   // Streamable-HTTP GET/DELETE are for stateful sessions; we run stateless.
@@ -239,20 +266,36 @@ export function createMcpServer<TAuth = unknown>(
           throw new Error('unauthenticated tool invocation');
         }
         const session = rc.session;
+        const meta: Readonly<Record<string, unknown>> = Object.freeze({ ...(extra._meta ?? {}) });
         const ctx: ToolContext<TAuth> = {
           auth: session.artifacts,
           connectionId: session.connectionId,
+          call: callContext(meta),
+          meta,
           logger: logger.child({ tool: def.name, connectionId: session.connectionId }),
           signal: extra.signal,
         };
         const run = async (): Promise<CallToolResult> => {
-          const result = await def.handler(args as never, ctx);
+          let result: unknown;
+          try {
+            result = await def.handler(args as never, ctx);
+          } catch (err) {
+            if (!ReauthRequired.is(err)) throw err;
+            // Drop the session so no later call reuses the refused credential,
+            // then let the HTTP layer answer 401. The result below is never sent.
+            rc.reauth = { tool: def.name, message: err.message };
+            if (rc.jti) {
+              await store.delete(rc.jti).catch((e: unknown) =>
+                ctx.logger.error('could not drop the rejected session', { error: (e as Error).message }),
+              );
+            }
+            return codedError('REAUTH_REQUIRED', 'the bound credential was rejected');
+          }
           if (devGuard) assertNoArtifactLeak(result, session.artifacts, ctx.logger);
           return toCallToolResult(result);
         };
 
-        const meta = extra._meta;
-        if (!idem || !meta || !Object.prototype.hasOwnProperty.call(meta, IDEMPOTENCY_META_KEY)) {
+        if (!idem || !Object.prototype.hasOwnProperty.call(meta, IDEMPOTENCY_META_KEY)) {
           return run();
         }
         const key = meta[IDEMPOTENCY_META_KEY];
@@ -270,8 +313,10 @@ export function createMcpServer<TAuth = unknown>(
             ttlSeconds: idem.ttlSeconds,
             waitMs: idem.waitMs,
             signal: extra.signal,
+            // A re-bind retry carries the same key: it must run, not replay this.
+            released: () => rc.reauth !== undefined,
             onStoreError: (err) =>
-              ctx.logger.error('idempotency: could not record the finished result', {
+              ctx.logger.error('idempotency: could not update the store entry', {
                 error: (err as Error).message,
               }),
           },
@@ -300,6 +345,27 @@ export function createMcpServer<TAuth = unknown>(
   };
 
   return instance;
+}
+
+/** The `_meta` keys the Hub sends as call context, kept only when they are strings. */
+function callContext(meta: Readonly<Record<string, unknown>>): CallContext {
+  const call: CallContext = {};
+  for (const key of ['currentPath', 'userId', 'tenantId', 'sessionId', 'threadId'] as const) {
+    const value = meta[key];
+    if (typeof value === 'string') call[key] = value;
+  }
+  return call;
+}
+
+/** The transport only reads the method, URL and headers; the body is passed pre-parsed. */
+function toWebRequest(req: Request): globalThis.Request {
+  const headers = new Headers();
+  for (const [name, value] of Object.entries(req.headers)) {
+    if (Array.isArray(value)) for (const v of value) headers.append(name, v);
+    else if (value !== undefined) headers.set(name, value);
+  }
+  const url = `${req.protocol}://${req.get('host') ?? 'localhost'}${req.originalUrl}`;
+  return new globalThis.Request(url, { method: req.method, headers });
 }
 
 function bearer(req: Request): string | undefined {

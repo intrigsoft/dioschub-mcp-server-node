@@ -19,6 +19,29 @@ export interface BoundSession<TAuth> {
 }
 
 /**
+ * Non-credential context the Hub sends with every tool call in `_meta`. Every
+ * field is optional: an older Hub, or a call made outside a chat turn, may
+ * omit any of them.
+ *
+ * These are hints for resolving what the user means ("the patient on screen"),
+ * NOT authorization. The request body carries them, so always check access
+ * with `ctx.auth` against the upstream app.
+ */
+export interface CallContext {
+  /**
+   * The page the user was on when the turn started, as the host app reported
+   * it. It is not updated if the user navigates while the turn runs.
+   */
+  currentPath?: string;
+  /** The Hub user the call runs for. */
+  userId?: string;
+  tenantId?: string;
+  /** The Hub chat session. Stable across the turns of one conversation. */
+  sessionId?: string;
+  threadId?: string;
+}
+
+/**
  * What every tool handler receives as its second argument. Business args come
  * first (validated against the tool's zod schema); this is everything else.
  */
@@ -27,6 +50,13 @@ export interface ToolContext<TAuth> {
   auth: TAuth;
   /** Which Hub connection this call is bound to — useful for correlation. */
   connectionId: string;
+  /** The Hub's call context (current page, user, session). Hints, not authorization. */
+  call: CallContext;
+  /**
+   * The call's raw `params._meta`, read-only, for keys `call` does not model
+   * (including `dioschub/*` extensions). Empty when the Hub sent none.
+   */
+  meta: Readonly<Record<string, unknown>>;
   /** Redaction-aware logger scoped to this tool + connection. Never logs `auth`. */
   logger: Logger;
   /** Aborts when the caller disconnects. Honor at the next boundary (drain-over-abort). */

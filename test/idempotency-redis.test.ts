@@ -264,3 +264,13 @@ test('IDEM-001 C11 R7 (redis): an unauthenticated call with a key gets 401 and t
   assert.equal(c.count, 0);
   await h.close();
 });
+
+test('REAUTH-010: release() deletes the prefixed key, so a re-bind retry can claim it again', async () => {
+  const fake = new FakeRedis();
+  const store: any = new RedisIdempotencyStore({ client: fake, keyPrefix: 'tst:idem:' });
+  assert.equal(await store.claim('scope', 60), true);
+  await store.release('scope');
+  assert.deepEqual(fake.commands.at(-1), { cmd: 'del', args: ['tst:idem:scope'] });
+  assert.equal(await store.get('scope'), null);
+  assert.equal(await store.claim('scope', 60), true);
+});

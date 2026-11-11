@@ -85,6 +85,11 @@ export class RedisIdempotencyStore implements IdempotencyStore {
     );
   }
 
+  async release(scope: string): Promise<void> {
+    const redis = await this.connection();
+    await redis.del(this.prefix + scope);
+  }
+
   async close(): Promise<void> {
     if (this.client) await this.client.quit();
   }

@@ -21,5 +21,12 @@ export interface IdempotencyStore {
   get(scope: string): Promise<IdempotencyEntry | null>;
   /** Move the entry to `done` with the finished result. */
   complete(scope: string, result: CallToolResult, ttlSeconds: number): Promise<void>;
+  /**
+   * Remove the entry, so the same key can run again. Used when a handler threw
+   * ReauthRequired: the Hub re-binds and sends the call again with the same
+   * key. A store without it keeps the entry `running` until its TTL, so that
+   * retry gets IN_PROGRESS instead of running.
+   */
+  release?(scope: string): Promise<void>;
   close?(): Promise<void>;
 }

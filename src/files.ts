@@ -88,7 +88,7 @@ export function createFileClient(config: FilesConfig): FileClient {
       const blob =
         input.content instanceof Blob
           ? input.content
-          : new Blob([input.content as BlobPart], input.mimeType ? { type: input.mimeType } : undefined);
+          : new Blob([input.content] as ConstructorParameters<typeof Blob>[0], input.mimeType ? { type: input.mimeType } : undefined);
       form.append('file', blob, input.filename);
       const res = await doFetch(`${base}/api/mcp/files/upload`, {
         method: 'POST',

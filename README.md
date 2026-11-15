@@ -256,6 +256,35 @@ runs longer than `ttlSeconds` outlives its entry: a duplicate after the expiry
 runs it again, and whichever run finishes last writes the entry. Set
 `ttlSeconds` well above your longest handler run and above `waitMs`.
 
+## File access
+
+On every tool call that has a chat session, the Hub puts an opaque, short-lived
+token (15 minutes, bound to the session, this server and this call) in
+`_meta["dioschub/fileAccess"]`. `createFileClient` reads it from `ctx` and calls
+the Hub's `get_file` / `put_file` endpoints with your `mcp-files:*` API key plus
+`X-File-Access-Token`:
+
+```ts
+import { createFileClient } from '@dioschub/mcp-server';
+
+const files = createFileClient({ url: process.env.HUB_URL!, apiKey: process.env.DIOSC_MCP_FILES_KEY! });
+
+handler: async ({ name }, ctx) => {
+  const res = await files.fetchFile(ctx, name);          // Response; stream res.body
+  const { filename } = await files.uploadFile(ctx, { filename: 'report.pdf', content: bytes, mimeType: 'application/pdf' });
+  return { stored: filename };
+},
+```
+
+- A call without a token throws `FileAccessTokenMissing`; there is no fallback to
+  sending only a session id (that path is deprecated on the Hub and removed in
+  the next release).
+- The Hub answers 403 for an invalid or expired token, a session that is no
+  longer live, or a server no longer attached; it surfaces as `FileAccessError`
+  with `status` and `code`.
+- The token is a credential: never log it and never return it in a tool result.
+  The helper does not log it and its errors do not carry it.
+
 ## Routes the framework owns
 
 - `POST {basePath}/bind` — app → MCP, admin-key authenticated. Body:

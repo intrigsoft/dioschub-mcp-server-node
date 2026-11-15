@@ -31,3 +31,34 @@ export class ReauthRequired extends Error {
     );
   }
 }
+
+/**
+ * Thrown by the file helpers when the call carries no
+ * `_meta["dioschub/fileAccess"]` token (an older Hub, a call outside a chat
+ * session, or a session-less call). The helpers never fall back to sending the
+ * session id alone: that legacy path is deprecated on the Hub.
+ */
+export class FileAccessTokenMissing extends Error {
+  constructor() {
+    super('this tool call carries no file access token (_meta["dioschub/fileAccess"]); the Hub did not grant file access for it');
+    this.name = 'FileAccessTokenMissing';
+  }
+}
+
+/**
+ * Thrown when the Hub refuses or fails a file call. `status` is the HTTP status
+ * (403 for an invalid or expired token, a mismatched session, a session that is
+ * no longer live, or a server no longer attached; 404 for an unknown file;
+ * 413/415 for a refused upload). `code` is the Hub's `code` field when it sent
+ * one. The message never contains the token.
+ */
+export class FileAccessError extends Error {
+  constructor(
+    readonly status: number,
+    readonly code: string | undefined,
+    readonly operation: 'fetch' | 'upload',
+  ) {
+    super(`Hub refused file ${operation} with ${status}${code ? ` (${code})` : ''}`);
+    this.name = 'FileAccessError';
+  }
+}

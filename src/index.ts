@@ -35,3 +35,7 @@ export type {
 export { HubBindError } from './hub-client.js';
 
 export { ReauthRequired } from './errors.js';
+
+export { FileAccessError, FileAccessTokenMissing } from './errors.js';
+export { createFileClient, FILE_ACCESS_META_KEY, FILE_ACCESS_HEADER } from './files.js';
+export type { FileClient, FilesConfig, FileCallContext, UploadFileInput } from './files.js';

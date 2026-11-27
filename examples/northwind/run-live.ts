@@ -9,6 +9,9 @@
  *   HUB_API_KEY   required — admin key scoped `auth:bind`
  *   MCP_PORT      default 8080  (the URL you register as a conduit MCP instance)
  *   BACKEND_PORT  default 3010
+ *   DIOSC_TEST_USERS  optional — test users the Hub's admin can sign in as, e.g.
+ *     [{"key":"alfki","name":"Maria (test)","readOnly":true,
+ *       "credentials":{"username":"ALFKI","password":"demo-password-not-real"}}]
  *
  * It logs in a demo user and prints that user's session cookie, so the
  * "host backend" step (POST {mcp}/bind with the wsId + cookie) can be driven

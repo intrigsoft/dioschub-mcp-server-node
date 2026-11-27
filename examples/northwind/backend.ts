@@ -37,6 +37,14 @@ const ORDERS: Record<string, Array<{ id: number; total: number }>> = {
 
 const COOKIE_NAME = 'nw_session';
 
+/**
+ * Accounts that can sign in through POST /login. Demo values only: a real app
+ * checks its own user store. The test users example signs in through here.
+ */
+const ACCOUNTS: Record<string, { password: string; customerId: string }> = {
+  ALFKI: { password: 'demo-password-not-real', customerId: 'ALFKI' },
+};
+
 function tokenFrom(req: Request): string | undefined {
   const cookie = req.header('cookie');
   if (!cookie) return undefined;
@@ -59,6 +67,19 @@ export function createNorthwindBackend(): NorthwindBackend {
     }
     (req as Request & { session: Session }).session = session;
     next();
+  });
+
+  // The app's own sign-in: username + password → session cookie.
+  app.post('/login', express.json(), (req, res) => {
+    const { username, password } = (req.body ?? {}) as { username?: unknown; password?: unknown };
+    const account = typeof username === 'string' ? ACCOUNTS[username] : undefined;
+    if (!account || password !== account.password) {
+      res.status(401).json({ error: 'bad credentials' });
+      return;
+    }
+    const token = randomUUID();
+    sessions.set(token, { user: username as string, customerId: account.customerId });
+    res.json({ cookie: `${COOKIE_NAME}=${token}` });
   });
 
   app.get('/api/products', (_req, res) => {

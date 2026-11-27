@@ -22,9 +22,14 @@ import { createNorthwindBackend } from './backend.js';
 import { createNorthwindMcp } from './northwind-mcp.js';
 
 const HUB_URL = process.env.HUB_URL ?? 'http://localhost:3333';
-// Default to the local dev admin-token bypass; override with a real diosc_ak_ key.
-const HUB_API_KEY = process.env.HUB_API_KEY ?? 'dev-admin-token-12345';
-const HUB_API_KEY_HEADER = process.env.HUB_API_KEY_HEADER ?? 'x-admin-token';
+// A Hub admin API key scoped `auth:bind` (an Owner creates it in the portal). The Hub's break-glass
+// admin token cannot bind: it is a recovery-only credential and has never held `auth:bind`.
+const HUB_API_KEY = process.env.HUB_API_KEY;
+if (!HUB_API_KEY) {
+  process.stderr.write('HUB_API_KEY is required: a Hub admin API key (diosc_ak_...) scoped auth:bind\n');
+  process.exit(1);
+}
+const HUB_API_KEY_HEADER = process.env.HUB_API_KEY_HEADER ?? 'x-api-key';
 const MCP_PORT = Number(process.env.MCP_PORT ?? 8080);
 const BACKEND_PORT = Number(process.env.BACKEND_PORT ?? 3010);
 const ADMIN_KEY = process.env.MCP_ADMIN_KEY ?? 'northwind-admin-key';

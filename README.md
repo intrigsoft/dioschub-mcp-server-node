@@ -508,8 +508,9 @@ To make this server's tools reachable by an assistant's LLM:
    trap when wiring a new server.
 
 `/bind` needs an admin credential with the `auth:bind` scope: a `diosc_ak_…` key
-(via `hub.apiKey`), or for local dev the `x-admin-token` bypass — pass it with
-`hub.apiKeyHeader: 'x-admin-token'`.
+(via `hub.apiKey`), which an Owner creates in the Hub's portal. The Hub's
+break-glass admin token (`x-admin-token`) cannot be used: it is a recovery-only
+credential and does not hold `auth:bind`.
 
 ## Scaling
 

@@ -208,6 +208,8 @@ export function createMcpServer<TAuth = unknown>(
     let session: BoundSession<TAuth> | null = null;
     let jti: string | null = null;
     let test: TestCallContext | undefined;
+    let testKey: string | undefined;
+    let testReadOnly = false;
 
     if (body?.method === 'tools/call') {
       const tool = toolName(body);
@@ -226,7 +228,8 @@ export function createMcpServer<TAuth = unknown>(
         const verified = await verifyHandle(token, secrets, config.name);
         jti = verified.jti;
         if (verified.test === true && verified.tu !== undefined) {
-          test = Object.freeze({ userKey: verified.tu, readOnly: verified.ro === true });
+          testKey = verified.tu;
+          testReadOnly = verified.ro === true;
         }
       } catch (err) {
         // Surface WHY the handle failed — wrong audience, expired, bad signature —
@@ -241,6 +244,21 @@ export function createMcpServer<TAuth = unknown>(
         });
         unauthorized(res, 'invalid_token');
         return;
+      }
+
+      if (testKey !== undefined) {
+        // The list is the allow-list, and it is read at start-up. A test handle
+        // minted before a restart that removed the user (or the whole list)
+        // stops working here, even though a shared store still holds its
+        // artifacts. Read only is the stricter of the handle and today's list.
+        const entry = testUsers?.byKey.get(testKey);
+        if (!entry) {
+          await store.delete(jti).catch(() => undefined);
+          logger.warn('tools/call rejected: test user is no longer listed', { tool, testUser: testKey });
+          unauthorized(res, 'unbound');
+          return;
+        }
+        test = Object.freeze({ userKey: testKey, readOnly: testReadOnly || entry.public.readOnly === true });
       }
 
       session = await store.get(jti);
@@ -407,8 +425,9 @@ export function createMcpServer<TAuth = unknown>(
   });
 
   // End a test sign-in early. Only a test handle; a real one is never touched.
+  // Answers even when test users are off: a handle minted before the list was
+  // removed can still be revoked.
   app.post(testUnbindPath, async (req: Request, res: Response) => {
-    if (!testUsers) return testDisabled(res);
     const token = bearer(req);
     if (!token) {
       unauthorized(res, 'missing_token');

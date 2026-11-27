@@ -436,7 +436,12 @@ handle. A hook that throws or rejects is logged and ignored; it is not awaited.
 - **The variable is a secret.** Set it as a secret in your platform, never in
   source control or an image. The credentials stay on this server: they are
   never in a route's answer, a log line, an event or an error.
-- **Restart to change the list.** It is read once at start-up.
+- **Restart to change the list.** It is read once at start-up. Removal takes
+  effect at once: a test handle whose user is no longer in the list (or whose
+  list is gone) is refused with `401 unbound` and its stored artifacts are
+  dropped, even with a shared store. A user you mark `readOnly` is read only
+  from the restart on, for handles minted before it too. `test-unbind` keeps
+  answering when test users are off, so an earlier handle can still be revoked.
 - **60 minutes, fixed.** A test handle and its stored artifacts last 60
   minutes, with no refresh, whatever `ttlSeconds` says. The Hub signs in again
   after that.

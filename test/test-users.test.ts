@@ -144,7 +144,7 @@ test('TU-CFG: the list is read from DIOSC_TEST_USERS by default, or the named va
 // ------------------------------------------------------------------ feature off
 
 async function assertOff(h: Awaited<ReturnType<typeof startTestUsers>>) {
-  for (const path of ['/test-users', '/test-bind', '/test-unbind']) {
+  for (const path of ['/test-users', '/test-bind']) {
     const res = await post(h.url, path, { ticket: 't', userKey: 'alice' });
     assert.equal(res.status, 404, path);
     assert.deepEqual(res.json, { error: 'not_found', code: 'test_users_disabled' }, path);
@@ -497,7 +497,52 @@ test('TU-UNBIND: no bearer or a bad bearer is 401', async () => {
   await h.close();
 });
 
+test('TU-UNBIND: with the list removed after a restart, an earlier test handle can still be unbound', async () => {
+  const before = await startTestUsers();
+  const { token } = await testSignIn(before, 'alice');
+  // The "restarted" server: same store and secrets, no test users.
+  const after = await startTestUsers({ testUsers: null, extra: { store: before.store } });
+  const res = await post(after.url, '/test-unbind', undefined, { authorization: `Bearer ${token}` });
+  assert.equal(res.status, 204);
+  assert.ok(before.store.deletes.length > 0);
+  await before.close();
+  await after.close();
+});
+
 // ------------------------------------------------------------------ /mcp
+
+test('TU-MCP: a test handle stops working once its user is off the list, though the store still has it', async () => {
+  const before = await startTestUsers();
+  for (const testUsers of [null, { users: JSON.stringify(USERS.filter((u) => u.key !== 'alice')) }]) {
+    const { token } = await testSignIn(before, 'alice');
+    const puts = before.store.puts.length;
+    const deletes = before.store.deletes.length;
+    assert.ok(puts > 0, 'the artifacts are in the shared store');
+    // The "restarted" server: same store and secrets, the user (or the whole list) gone.
+    const after = await startTestUsers({ testUsers, extra: { store: before.store } });
+    const reply = await rpc(after.url, 'tools/call', { name: 'read', arguments: {} }, token);
+    assert.equal(reply.status, 401);
+    assert.equal(reply.body.code, 'unbound');
+    assert.equal(after.seen.length, 0, 'the handler never runs');
+    assert.equal(before.store.deletes.length, deletes + 1, 'the stored artifacts are dropped');
+    await after.close();
+  }
+  await before.close();
+});
+
+test('TU-RO: a user marked read only after sign-in is read only at once', async () => {
+  const before = await startTestUsers();
+  const { token } = await testSignIn(before, 'alice');
+  const users = USERS.map((u) => (u.key === 'alice' ? { ...u, readOnly: true } : u));
+  const after = await startTestUsers({ testUsers: { users: JSON.stringify(users) }, extra: { store: before.store } });
+  const refused = await rpc(after.url, 'tools/call', { name: 'write', arguments: {} }, token);
+  assert.equal(after.seen.length, 0);
+  assert.match(JSON.stringify(refused.body), /test_read_only/);
+  assert.equal((await rpc(after.url, 'tools/call', { name: 'read', arguments: {} }, token)).status, 200);
+  assert.deepEqual(after.seen[0]!.ctx.test, { userKey: 'alice', readOnly: true });
+  await before.close();
+  await after.close();
+});
 
 test('TU-MCP: a test handle sets ctx.test and replays the login artifacts; a real handle has no ctx.test', async () => {
   const h = await startTestUsers();

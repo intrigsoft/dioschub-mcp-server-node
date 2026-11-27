@@ -1,5 +1,5 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
-import type { BoundSession } from './types.js';
+import type { BoundSession, TestCallContext } from './types.js';
 
 /**
  * Carries the resolved session from the HTTP layer (where the JWT is verified
@@ -12,6 +12,8 @@ export interface RequestContext<TAuth> {
   session: BoundSession<TAuth> | null;
   /** The verified handle's jti, so a handler's ReauthRequired can drop the session. */
   jti: string | null;
+  /** Set when the verified handle is a test handle. */
+  test?: TestCallContext;
   /**
    * Set when a handler threw ReauthRequired. The HTTP layer then answers 401
    * instead of the transport's tool result.

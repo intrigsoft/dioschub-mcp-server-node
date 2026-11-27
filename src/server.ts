@@ -10,6 +10,8 @@ import type {
   BoundSession,
   CallContext,
   CreateMcpServerConfig,
+  TestCallContext,
+  TestUserEvent,
   ToolContext,
   ToolDefinition,
 } from './types.js';
@@ -17,7 +19,7 @@ import { defaultLogger, type Logger } from './logger.js';
 import { MemoryArtifactStore } from './store/memory-store.js';
 import type { ArtifactStore } from './store/artifact-store.js';
 import { signHandle, verifyHandle } from './jwt.js';
-import { HubClient, type HubBinder } from './hub-client.js';
+import { HubClient, HubTestCallError, type HubBinder } from './hub-client.js';
 import { requestContext, type RequestContext } from './context.js';
 import { ReauthRequired } from './errors.js';
 import { assertNoArtifactLeak, toCallToolResult, type CallToolResult } from './result.js';
@@ -32,6 +34,16 @@ import {
   isValidIdempotencyKey,
   runDeduplicated,
 } from './idempotency/index.js';
+import {
+  AttemptLimiter,
+  DEFAULT_TEST_RATE_LIMIT_PER_MINUTE,
+  TEST_HANDLE_TTL_SECONDS,
+  TEST_USERS_CAPABILITY,
+  TestUsersConfigError,
+  loadTestUsers,
+  readLoginResult,
+  type LoadedTestUsers,
+} from './test-users.js';
 
 const DEFAULT_TTL_SECONDS = 8 * 60 * 60;
 
@@ -81,6 +93,56 @@ export function createMcpServer<TAuth = unknown>(
   const base = (config.basePath ?? '').replace(/\/+$/, '');
   const bindPath = base + '/bind';
   const mcpPath = base + '/mcp';
+  const testUsersPath = base + '/test-users';
+  const testBindPath = base + '/test-bind';
+  const testUnbindPath = base + '/test-unbind';
+
+  // ── test users ─────────────────────────────────────────────────────────────
+  // Checked here, at start-up, so a bad list stops the server instead of
+  // failing on the admin's first click. Messages never quote the list.
+  const testConfig = config.testUsers;
+  let testUsers: LoadedTestUsers | null = null;
+  let limiter: AttemptLimiter | null = null;
+  if (testConfig !== undefined) {
+    if (typeof testConfig !== 'object' || testConfig === null) {
+      throw new TestUsersConfigError('testUsers must be an object');
+    }
+    if (typeof testConfig.login !== 'function') {
+      throw new TestUsersConfigError('testUsers.login must be a function');
+    }
+    if (testConfig.onEvent !== undefined && typeof testConfig.onEvent !== 'function') {
+      throw new TestUsersConfigError('testUsers.onEvent must be a function');
+    }
+    const perMinute = testConfig.rateLimitPerMinute ?? DEFAULT_TEST_RATE_LIMIT_PER_MINUTE;
+    if (!Number.isInteger(perMinute) || perMinute < 1) {
+      throw new TestUsersConfigError('testUsers.rateLimitPerMinute must be a positive whole number');
+    }
+    const loaded = loadTestUsers(testConfig);
+    if (!loaded) {
+      logger.info('test users off: the list is unset or empty');
+    } else if (typeof hub.verifyTestTicket !== 'function' || typeof hub.testBind !== 'function') {
+      logger.warn('test users off: the hub client cannot make the test calls (verifyTestTicket, testBind)');
+    } else {
+      testUsers = loaded;
+      limiter = new AttemptLimiter(perMinute);
+      logger.info('test users on', { count: loaded.publicList.length, source: loaded.source });
+    }
+  }
+
+  /** Fire the audit hook. Never awaited: a slow or failing hook cannot hold a call. */
+  function emit(event: Omit<TestUserEvent, 'at'>): void {
+    const hook = testConfig?.onEvent;
+    if (!hook) return;
+    const full: TestUserEvent = { ...event, at: new Date().toISOString() };
+    const report = (err: unknown) =>
+      logger.error('testUsers.onEvent failed; ignored', { event: event.type, error: errorName(err) });
+    try {
+      const out = hook.call(testConfig, full);
+      if (out && typeof (out as Promise<void>).then === 'function') (out as Promise<void>).catch(report);
+    } catch (err) {
+      report(err);
+    }
+  }
 
   const tools: ToolDefinition<z.ZodObject<z.ZodRawShape>, TAuth>[] = [];
 
@@ -145,6 +207,7 @@ export function createMcpServer<TAuth = unknown>(
     const body = req.body as { method?: string } | undefined;
     let session: BoundSession<TAuth> | null = null;
     let jti: string | null = null;
+    let test: TestCallContext | undefined;
 
     if (body?.method === 'tools/call') {
       const tool = toolName(body);
@@ -160,7 +223,11 @@ export function createMcpServer<TAuth = unknown>(
       }
 
       try {
-        ({ jti } = await verifyHandle(token, secrets, config.name));
+        const verified = await verifyHandle(token, secrets, config.name);
+        jti = verified.jti;
+        if (verified.test === true && verified.tu !== undefined) {
+          test = Object.freeze({ userKey: verified.tu, readOnly: verified.ro === true });
+        }
       } catch (err) {
         // Surface WHY the handle failed — wrong audience, expired, bad signature —
         // by decoding (NOT verifying) its claims. This is the log that turns a
@@ -202,7 +269,7 @@ export function createMcpServer<TAuth = unknown>(
       });
     });
 
-    const rc: RequestContext<TAuth> = { session, jti };
+    const rc: RequestContext<TAuth> = { session, jti, ...(test ? { test } : {}) };
     await server.connect(transport);
     const reply = await Promise.race([
       requestContext.run(rc, () => transport.handleRequest(toWebRequest(req), { parsedBody: body })),
@@ -223,6 +290,193 @@ export function createMcpServer<TAuth = unknown>(
     res.end(Buffer.from(await reply.arrayBuffer()));
   });
 
+  // ── test users routes ──────────────────────────────────────────────────────
+  // The Hub calls these. They carry no credential header: the Hub's one-time
+  // ticket is the authority, and only the Hub can judge it, so every answer
+  // past the rate limit waits for the Hub's word. The handle never goes back
+  // on these answers; it goes to the configured Hub URL only.
+
+  // The Hub's list request: public parts only.
+  app.post(testUsersPath, async (req: Request, res: Response) => {
+    if (!testUsers) return testDisabled(res);
+    if (rateLimited(res)) return;
+    const ticket = stringField(req.body, 'ticket');
+    if (!ticket) {
+      send(res, 400, { error: 'bad_request', code: 'missing_fields', detail: 'ticket is required' });
+      return;
+    }
+    const valid = await checkTicket(res, { ticket, purpose: 'list' }, requestSignal(res));
+    if (valid === null) return;
+    if (!valid) {
+      logger.warn('test-users refused: invalid ticket');
+      send(res, 401, { error: 'unauthorized', code: 'invalid_ticket' });
+      return;
+    }
+    logger.info('test users listed', { count: testUsers.publicList.length });
+    send(res, 200, { users: testUsers.publicList });
+  });
+
+  // The Hub's sign-in request for one test user. The handle goes to the Hub by
+  // a separate call; this answer carries only the expiry.
+  app.post(testBindPath, async (req: Request, res: Response) => {
+    if (!testUsers || !testConfig) return testDisabled(res);
+    if (rateLimited(res)) return;
+    const ticket = stringField(req.body, 'ticket');
+    const userKey = stringField(req.body, 'userKey');
+    if (!ticket || !userKey) {
+      send(res, 400, { error: 'bad_request', code: 'missing_fields', detail: 'ticket and userKey are required' });
+      return;
+    }
+    const signal = requestSignal(res);
+
+    // 1. The Hub vouches for the ticket and the user before anyone signs in.
+    const valid = await checkTicket(res, { ticket, purpose: 'bind', userKey }, signal);
+    if (valid === null) return;
+    if (!valid) {
+      logger.warn('test-bind refused: invalid ticket');
+      send(res, 401, { error: 'unauthorized', code: 'invalid_ticket' });
+      return;
+    }
+    const user = testUsers.byKey.get(userKey);
+    if (!user) {
+      logger.warn('test-bind refused: unknown test user');
+      emit({ type: 'test-login-failed', userKey, reason: 'unknown_test_user' });
+      send(res, 404, { error: 'not_found', code: 'unknown_test_user' });
+      return;
+    }
+    const readOnly = user.public.readOnly === true;
+    const userLogger = logger.child({ testUser: userKey });
+
+    // 2. The author's script signs in to the real auth service. Its error is
+    // not logged or answered: it may quote what it was given.
+    let login: ReturnType<typeof readLoginResult<TAuth>>;
+    try {
+      login = readLoginResult<TAuth>(
+        await testConfig.login(user.credentials, user.public, { logger: userLogger, signal }),
+      );
+    } catch (err) {
+      userLogger.warn('test login failed', { errorType: errorName(err) });
+      emit({ type: 'test-login-failed', userKey, reason: 'login_failed' });
+      send(res, 502, { error: 'test_bind_failed', code: 'test_login_failed' });
+      return;
+    }
+    if (!login) {
+      userLogger.error('test login returned no auth, or an identity without userId, username and role { id, name }');
+      emit({ type: 'test-login-failed', userKey, reason: 'invalid_login_result' });
+      send(res, 502, { error: 'test_bind_failed', code: 'test_login_failed' });
+      return;
+    }
+
+    // 3. Store as for a real user, under a fresh jti, for the fixed 60 minutes.
+    const jti = randomUUID();
+    const now = Math.floor(Date.now() / 1000);
+    const expiresAt = new Date((now + TEST_HANDLE_TTL_SECONDS) * 1000).toISOString();
+    let token: string;
+    try {
+      await store.put(jti, { connectionId: `test:${jti}`, artifacts: login.auth }, TEST_HANDLE_TTL_SECONDS);
+      token = await signHandle(
+        { jti, aud: config.name, test: true, tu: userKey, ...(readOnly ? { ro: true as const } : {}) },
+        signingSecret,
+        TEST_HANDLE_TTL_SECONDS,
+        now,
+      );
+    } catch (err) {
+      await dropTestSession(jti, userLogger);
+      userLogger.error('test-bind: could not store the session', { errorType: errorName(err) });
+      emit({ type: 'test-login-failed', userKey, reason: 'store_failed' });
+      send(res, 500, { error: 'internal', code: 'store_failed' });
+      return;
+    }
+
+    // 4. Deliver the handle to the configured Hub, quoting the ticket.
+    try {
+      await hub.testBind!({ ticket, userKey, readOnly, identity: login.identity, token, expiresAt }, signal);
+    } catch (err) {
+      // Roll back: a handle the Hub never took must not stay usable.
+      await dropTestSession(jti, userLogger);
+      userLogger.error('test-bind: hub delivery failed', hubErrorFields(err));
+      emit({ type: 'test-login-failed', userKey, reason: 'hub_delivery_failed' });
+      send(res, 502, { error: 'test_bind_failed', code: 'hub_delivery_failed' });
+      return;
+    }
+
+    // 5. Done. The handle is not in this answer.
+    userLogger.info('test user signed in', { readOnly, expiresAt, jti });
+    emit({ type: 'test-login', userKey });
+    send(res, 200, { ok: true, expiresAt });
+  });
+
+  // End a test sign-in early. Only a test handle; a real one is never touched.
+  app.post(testUnbindPath, async (req: Request, res: Response) => {
+    if (!testUsers) return testDisabled(res);
+    const token = bearer(req);
+    if (!token) {
+      unauthorized(res, 'missing_token');
+      return;
+    }
+    let claims: Awaited<ReturnType<typeof verifyHandle>>;
+    try {
+      claims = await verifyHandle(token, secrets, config.name);
+    } catch {
+      logger.warn('test-unbind rejected: handle failed verification');
+      unauthorized(res, 'invalid_token');
+      return;
+    }
+    if (claims.test !== true || claims.tu === undefined) {
+      logger.warn('test-unbind refused: not a test handle');
+      send(res, 403, { error: 'forbidden', code: 'not_a_test_handle' });
+      return;
+    }
+    try {
+      await store.delete(claims.jti);
+    } catch (err) {
+      logger.error('test-unbind: could not drop the session', { testUser: claims.tu, errorType: errorName(err) });
+      send(res, 500, { error: 'internal', code: 'store_failed' });
+      return;
+    }
+    logger.info('test user signed out', { testUser: claims.tu, jti: claims.jti });
+    emit({ type: 'test-unbind', userKey: claims.tu });
+    res.status(204).end();
+  });
+
+  function testDisabled(res: Response): void {
+    send(res, 404, { error: 'not_found', code: 'test_users_disabled' });
+  }
+
+  /** Count the attempt before the Hub is asked; answer 429 past the limit. */
+  function rateLimited(res: Response): boolean {
+    const wait = limiter!.take();
+    if (wait === 0) return false;
+    logger.warn('test users route rate limited', { retryAfterSeconds: wait });
+    res.set('Retry-After', String(wait));
+    send(res, 429, { error: 'too_many_requests', code: 'rate_limited' });
+    return true;
+  }
+
+  /** The Hub's verdict on a ticket, or null when it could not be asked (answered 502). */
+  async function checkTicket(
+    res: Response,
+    check: { ticket: string; purpose: 'list' | 'bind'; userKey?: string },
+    signal: AbortSignal,
+  ): Promise<boolean | null> {
+    try {
+      return await hub.verifyTestTicket!(check, signal);
+    } catch (err) {
+      logger.error('test users: could not check the ticket with the hub', {
+        purpose: check.purpose,
+        ...hubErrorFields(err),
+      });
+      send(res, 502, { error: 'ticket_check_failed', code: 'hub_unreachable' });
+      return null;
+    }
+  }
+
+  async function dropTestSession(jti: string, log: Logger): Promise<void> {
+    await store.delete(jti).catch((e: unknown) =>
+      log.error('test-bind: could not drop the stored session', { errorType: errorName(e) }),
+    );
+  }
+
   // Streamable-HTTP GET/DELETE are for stateful sessions; we run stateless.
   app.get(mcpPath, (_req, res) => {
     send(res, 405, { error: 'method_not_allowed' });
@@ -233,11 +487,13 @@ export function createMcpServer<TAuth = unknown>(
 
   // Build a fresh MCP server per request (connect-per-call) with all tools.
   function buildMcpServer(): McpServer {
+    const experimental: Record<string, object> = {
+      ...(idem ? { [IDEMPOTENCY_CAPABILITY]: { version: 1 } } : {}),
+      ...(testUsers ? { [TEST_USERS_CAPABILITY]: { version: 1 } } : {}),
+    };
     const server = new McpServer(
       { name: config.name, version: config.version ?? '0.0.0' },
-      idem
-        ? { capabilities: { experimental: { [IDEMPOTENCY_CAPABILITY]: { version: 1 } } } }
-        : undefined,
+      Object.keys(experimental).length > 0 ? { capabilities: { experimental } } : undefined,
     );
     for (const def of tools) registerTool(server, def);
     return server;
@@ -266,15 +522,35 @@ export function createMcpServer<TAuth = unknown>(
           throw new Error('unauthenticated tool invocation');
         }
         const session = rc.session;
+        const test = rc.test;
         const meta: Readonly<Record<string, unknown>> = Object.freeze({ ...(extra._meta ?? {}) });
         const ctx: ToolContext<TAuth> = {
           auth: session.artifacts,
           connectionId: session.connectionId,
           call: callContext(meta),
           meta,
-          logger: logger.child({ tool: def.name, connectionId: session.connectionId }),
+          logger: logger.child({
+            tool: def.name,
+            connectionId: session.connectionId,
+            ...(test ? { testUser: test.userKey } : {}),
+          }),
           signal: extra.signal,
+          ...(test ? { test } : {}),
         };
+
+        if (test) {
+          // Read-only guard: before the handler and before dedup, so nothing runs
+          // and nothing is cached. Only an explicit readOnlyHint: true passes.
+          if (test.readOnly && def.annotations?.readOnlyHint !== true) {
+            ctx.logger.info('test call refused: read-only test user, tool not marked readOnlyHint');
+            emit({ type: 'test-call-refused', userKey: test.userKey, tool: def.name, reason: 'read_only' });
+            return codedError(
+              'test_read_only',
+              'this test user is read only, and this tool is not marked read only',
+            );
+          }
+          emit({ type: 'test-call', userKey: test.userKey, tool: def.name });
+        }
         const run = async (): Promise<CallToolResult> => {
           let result: unknown;
           try {
@@ -394,6 +670,35 @@ function peekClaims(token: string): string {
   } catch {
     return '<unparseable>';
   }
+}
+
+/** A non-empty string field of a JSON body, else undefined. */
+function stringField(body: unknown, field: string): string | undefined {
+  if (typeof body !== 'object' || body === null) return undefined;
+  const value = (body as Record<string, unknown>)[field];
+  return typeof value === 'string' && value.length > 0 ? value : undefined;
+}
+
+/** Aborts when the caller hangs up before we answer. */
+function requestSignal(res: Response): AbortSignal {
+  const controller = new AbortController();
+  res.on('close', () => {
+    if (!res.writableFinished) controller.abort();
+  });
+  return controller.signal;
+}
+
+/** The error's class name only: never its message, which may quote a credential. */
+function errorName(err: unknown): string {
+  return err instanceof Error ? err.name : typeof err;
+}
+
+/** Safe fields for a failed Hub call: status and the Hub's code, never a body. */
+function hubErrorFields(err: unknown): Record<string, unknown> {
+  if (err instanceof HubTestCallError) {
+    return { status: err.status, ...(err.code ? { hubCode: err.code } : {}) };
+  }
+  return { errorType: errorName(err) };
 }
 
 function unauthorized(res: Response, code: string): void {

@@ -113,6 +113,7 @@ A handler's second argument:
 | `meta`         | The call's raw `_meta`, read-only, for keys `call` does not model. |
 | `logger`       | Scoped to this tool and connection; never logs `auth`. |
 | `signal`       | Aborts when the caller disconnects. |
+| `test`         | Only on a call made as a test user: `{ userKey, readOnly }`. See *Test users*. |
 
 `ctx.call` lets a tool resolve "the patient on screen" without the model having
 to repeat an id:
@@ -173,13 +174,14 @@ lifetime to get a clean re-bind: expiry and early rejection both end in one.
 | `name`        | yes      | Server name; also the JWT audience.                                   |
 | `adminKey`    | yes      | Authenticates the app's `/bind` call. Must be an **admin** key.       |
 | `jwtSecrets`  | yes      | HS256 secret, or an array (first signs, all verify → zero-downtime rotation). |
-| `hub`         | yes*     | `{ url, apiKey, bindPath?, apiKeyHeader?, instanceName? }`. `apiKey` = a `diosc_ak_…` admin key scoped `auth:bind`. Default path `/api/auth/bind`, header `x-api-key`. `instanceName` = this server's **Hub instance name**, used to scope the handle to us; defaults to `name`, must match the Hub exactly. |
+| `hub`         | yes*     | `{ url, apiKey, bindPath?, apiKeyHeader?, instanceName?, testTicketVerifyPath?, testBindPath? }`. `apiKey` = a `diosc_ak_…` admin key scoped `auth:bind`. Default path `/api/auth/bind`, header `x-api-key`. `instanceName` = this server's **Hub instance name**, used to scope the handle to us; defaults to `name`, must match the Hub exactly. The two test paths default to `/api/auth/test-tickets/verify` and `/api/auth/test-bind`. |
 | `hubClient`   | yes*     | \*Provide `hub` **or** `hubClient` (a custom `HubBinder`).            |
 | `store`       | no       | `MemoryArtifactStore` (default) or `RedisArtifactStore`.              |
 | `ttlSeconds`  | no       | Session + JWT lifetime. Default `28800` (8h).                         |
 | `basePath`    | no       | Mount prefix for `/bind` and `/mcp`.                                  |
 | `devGuard`    | no       | Scan tool results for leaked artifacts. Default on outside production.|
 | `idempotency` | no       | `false` to disable, or `{ store?, ttlSeconds?, waitMs? }`. On by default (see *Idempotency*). |
+| `testUsers`   | no       | `{ login, users?, env?, onEvent?, rateLimitPerMinute? }`. Off by default (see *Test users*). |
 
 ## Tool annotations
 
@@ -285,6 +287,187 @@ handler: async ({ name }, ctx) => {
 - The token is a credential: never log it and never return it in a tool result.
   The helper does not log it and its errors do not carry it.
 
+## Test users
+
+Let the Hub's admin try your tools **as a real user** without anyone typing a
+password into the Hub. You list a few test accounts in a secret environment
+variable; the admin picks one in the Hub; the framework signs that account in
+with your own script and binds it exactly as a real user would be bound. The
+account's credentials never leave this server.
+
+### The list: `DIOSC_TEST_USERS`
+
+A JSON list. Each entry has a public part, shown to the admin, and a private
+part, `credentials`, which only your `login` script ever sees:
+
+```json
+[
+  {
+    "key": "maria.test",
+    "name": "Maria Example (test)",
+    "note": "Customer with two open orders",
+    "credentials": { "username": "maria.test@example.invalid", "password": "fake-password-1" }
+  },
+  {
+    "key": "auditor.test",
+    "name": "Read-only auditor (test)",
+    "readOnly": true,
+    "credentials": { "username": "auditor.test@example.invalid", "password": "fake-password-2" }
+  }
+]
+```
+
+| Field         | Rule |
+| ------------- | ---- |
+| `key`         | `^[a-z0-9][a-z0-9._-]{0,63}$`, unique in the list. The Hub matches a test user across servers by this key. |
+| `name`        | 1 to 100 characters. |
+| `note`        | Optional, up to 200 characters. |
+| `readOnly`    | Optional `true`: only read-only tools run for this user (below). |
+| `credentials` | Required. Any shape your script needs: a username and password, an API token, a client id and secret. |
+
+At most 50 entries. The list is checked when the server starts: a list that
+is not valid JSON, or breaks a rule, stops the server with a
+`TestUsersConfigError` naming the entry's position (never its values). Unset,
+empty or `[]`: the feature is off.
+
+Pass `testUsers.env` to read another variable, or `testUsers.users` to pass
+the JSON text (or a parsed list) yourself.
+
+### The `login` script
+
+```ts
+const server = createMcpServer<NorthwindAuth>({
+  /* … */
+  testUsers: {
+    async login(credentials, entry, ctx) {
+      const { username, password } = credentials as { username: string; password: string };
+      // Sign in to the real auth service, exactly as your app's login page does.
+      const res = await fetch(`${API}/login`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ username, password }),
+        signal: ctx.signal,
+      });
+      if (!res.ok) throw new Error(`login refused with ${res.status}`);
+      const { cookie } = await res.json();
+      return {
+        auth: { sessionCookie: cookie },               // what a real /bind would have carried
+        identity: { userId: username, username, role: { id: 'customer', name: 'Customer' } },
+      };
+    },
+    onEvent: (event) => audit.write(event),           // optional
+  },
+});
+```
+
+`login` gets the entry's `credentials`, its public part, and `{ logger, signal }`.
+It returns the artifacts your tools read from `ctx.auth`, plus the identity your
+app would assert at bind (the Hub matches the role by name, as for a real user).
+Throw when the sign-in fails. The framework does not log or forward your
+error (it may quote what it was given); the Hub gets `test_login_failed`. Log
+what you need with `ctx.logger`, never the credentials.
+
+### What happens
+
+1. The admin opens a tool test or a test conversation in the Hub. The Hub
+   posts a one-time ticket to `POST {basePath}/test-users`; the framework asks
+   the Hub whether the ticket is real (`POST /api/auth/test-tickets/verify`)
+   and answers with the public parts of the list.
+2. The admin picks a user. The Hub posts `{ ticket, userKey }` to
+   `POST {basePath}/test-bind`. The framework checks the ticket with the Hub
+   first, then runs your `login`, stores the artifacts, mints a **test handle**,
+   and hands it to the Hub with `POST /api/auth/test-bind` and your
+   `hub.apiKey`. The route's own answer is only `{ ok: true, expiresAt }`: the
+   handle goes to the configured Hub URL and nowhere else. If the Hub does not
+   take it, the stored artifacts are dropped.
+3. Tool calls with that handle run like any other, with `ctx.test` set.
+4. The Hub ends the sign-in with `POST {basePath}/test-unbind` (the handle as
+   the bearer), or it expires.
+
+The routes carry no credential header: the Hub's ticket is the authority, and
+a caller without a ticket the Hub issued gets nothing. On initialize the
+server declares `capabilities.experimental["dioschub/testUsers"] = { version: 1 }`,
+only when the feature is on, so the Hub knows to offer the list.
+
+What the admin sees: each test user's `name`, `note` and whether it is read
+only, for this server. After signing in, the tools run as that user, with the
+role your identity names.
+
+### In a tool
+
+```ts
+handler: async (args, ctx) => {
+  if (ctx.test) ctx.logger.info('test call', { testUser: ctx.test.userKey });
+  /* … */
+},
+```
+
+`ctx.test` is `{ userKey, readOnly }` on a test call and absent on a real one.
+
+### Read-only test users
+
+For an entry with `readOnly: true`, a tool runs only when its annotations say
+`readOnlyHint: true`. Any other tool is refused before its handler runs, with
+a tool error:
+
+```json
+{ "isError": true,
+  "structuredContent": { "success": false, "code": "test_read_only",
+    "message": "this test user is read only, and this tool is not marked read only" } }
+```
+
+Mark your read tools `annotations: { readOnlyHint: true }`. A tool without the
+annotation counts as one that changes things.
+
+### Events
+
+`onEvent` receives `{ type, userKey, at, tool?, reason? }`, where `type` is
+`test-login`, `test-login-failed`, `test-call`, `test-call-refused` or
+`test-unbind`, and `at` is an ISO 8601 time. `reason` is a fixed code
+(`unknown_test_user`, `login_failed`, `invalid_login_result`, `store_failed`,
+`hub_delivery_failed`, `read_only`). Events never carry credentials or the
+handle. A hook that throws or rejects is logged and ignored; it is not awaited.
+
+### Security notes
+
+- **Use accounts you accept being used this way.** Anyone the Hub lets test
+  as a user acts as that account in your app. Prefer dedicated test accounts
+  with test data, and `readOnly` where a test needs no writes.
+- **The variable is a secret.** Set it as a secret in your platform, never in
+  source control or an image. The credentials stay on this server: they are
+  never in a route's answer, a log line, an event or an error.
+- **Restart to change the list.** It is read once at start-up. Removal takes
+  effect at once: a test handle whose user is no longer in the list (or whose
+  list is gone) is refused with `401 unbound` and its stored artifacts are
+  dropped, even with a shared store. A user you mark `readOnly` is read only
+  from the restart on, for handles minted before it too. `test-unbind` keeps
+  answering when test users are off, so an earlier handle can still be revoked.
+- **60 minutes, fixed.** A test handle and its stored artifacts last 60
+  minutes, with no refresh, whatever `ttlSeconds` says. The Hub signs in again
+  after that.
+- **Rate limit, per process.** `test-users` and `test-bind` together accept
+  30 attempts a minute (`testUsers.rateLimitPerMinute`), counted before the Hub
+  is asked; past that they answer `429` with `Retry-After`. The count is kept
+  in memory, so each replica counts on its own.
+- The handle is delivered only to `hub.url`. A test route never mints a real
+  handle and never touches a real user's stored session; `test-unbind` refuses
+  a real handle with `403 not_a_test_handle`.
+
+### Answers
+
+| Route | Status | `code` |
+| ----- | ------ | ------ |
+| any test route, feature off | 404 | `test_users_disabled` |
+| `test-users`, `test-bind` | 400 | `missing_fields` |
+| `test-users`, `test-bind` | 401 | `invalid_ticket` |
+| `test-users`, `test-bind` | 429 | `rate_limited` |
+| `test-users`, `test-bind` | 502 | `hub_unreachable` (the ticket could not be checked) |
+| `test-bind` | 404 | `unknown_test_user` |
+| `test-bind` | 502 | `test_login_failed`, `hub_delivery_failed` |
+| `test-bind`, `test-unbind` | 500 | `store_failed` |
+| `test-unbind` | 401 | `missing_token`, `invalid_token` |
+| `test-unbind` | 403 | `not_a_test_handle` |
+
 ## Routes the framework owns
 
 - `POST {basePath}/bind` — app → MCP, admin-key authenticated. Body:
@@ -294,6 +477,9 @@ handler: async ({ name }, ctx) => {
 - `POST {basePath}/mcp` — the MCP endpoint (streamable HTTP, stateless / connect-per-call,
   JSON responses: the reply is written once the handler finishes, so a handler can
   still turn it into a 401).
+- `POST {basePath}/test-users`, `POST {basePath}/test-bind`,
+  `POST {basePath}/test-unbind` — Hub → MCP, for test users (see *Test users*).
+  They answer `404 test_users_disabled` while the feature is off.
 
 Mount your own routes (health, readiness) on `server.app`.
 
@@ -322,8 +508,9 @@ To make this server's tools reachable by an assistant's LLM:
    trap when wiring a new server.
 
 `/bind` needs an admin credential with the `auth:bind` scope: a `diosc_ak_…` key
-(via `hub.apiKey`), or for local dev the `x-admin-token` bypass — pass it with
-`hub.apiKeyHeader: 'x-admin-token'`.
+(via `hub.apiKey`), which an Owner creates in the Hub's portal. The Hub's
+break-glass admin token (`x-admin-token`) cannot be used: it is a recovery-only
+credential and does not hold `auth:bind`.
 
 ## Scaling
 

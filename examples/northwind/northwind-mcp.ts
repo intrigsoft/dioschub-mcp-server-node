@@ -21,6 +21,17 @@ export interface NorthwindMcpConfig {
   /** Provide a fake binder (tests) OR real hub config (live). One is required. */
   hubClient?: HubBinder;
   hub?: HubConfig;
+  /**
+   * The test users list as JSON. Default: the DIOSC_TEST_USERS variable. Each
+   * entry's credentials are `{ username, password }` for Northwind's /login.
+   */
+  testUsers?: string;
+}
+
+/** The private part of a Northwind test user entry. */
+interface NorthwindTestCredentials {
+  username: string;
+  password: string;
 }
 
 export function createNorthwindMcp(config: NorthwindMcpConfig): DioscMcpServer<NorthwindAuth> {
@@ -30,6 +41,28 @@ export function createNorthwindMcp(config: NorthwindMcpConfig): DioscMcpServer<N
     jwtSecrets: config.jwtSecret,
     ...(config.hubClient ? { hubClient: config.hubClient } : {}),
     ...(config.hub ? { hub: config.hub } : {}),
+    // Test users: the Hub's admin can sign in as one of these to try the tools.
+    // Off unless the list (DIOSC_TEST_USERS) has entries.
+    testUsers: {
+      users: config.testUsers,
+      async login(credentials, _entry, ctx) {
+        const { username, password } = credentials as NorthwindTestCredentials;
+        // Sign in exactly as the app's own login page would.
+        const res = await fetch(`${config.apiUrl}/login`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ username, password }),
+          signal: ctx.signal,
+        });
+        if (!res.ok) throw new Error(`northwind login refused with ${res.status}`);
+        const { cookie } = (await res.json()) as { cookie: string };
+        return {
+          auth: { sessionCookie: cookie },
+          identity: { userId: username, username, role: { id: 'customer', name: 'Customer' } },
+        };
+      },
+      onEvent: (event) => process.stderr.write(`[test users] ${JSON.stringify(event)}\n`),
+    },
   });
 
   const call = async (
@@ -57,12 +90,15 @@ export function createNorthwindMcp(config: NorthwindMcpConfig): DioscMcpServer<N
       name: 'list_products',
       description: 'List Northwind products',
       input: z.object({}),
+      // Read only, so a read-only test user may call it too.
+      annotations: { readOnlyHint: true },
       handler: (_args, ctx) => call(ctx, '/api/products'),
     })
     .tool({
       name: 'my_orders',
       description: 'List orders belonging to the signed-in customer',
       input: z.object({}),
+      annotations: { readOnlyHint: true },
       handler: (_args, ctx) => call(ctx, '/api/orders'),
     });
 

@@ -9,6 +9,9 @@
  *   HUB_API_KEY   required — admin key scoped `auth:bind`
  *   MCP_PORT      default 8080  (the URL you register as a conduit MCP instance)
  *   BACKEND_PORT  default 3010
+ *   DIOSC_TEST_USERS  optional — test users the Hub's admin can sign in as, e.g.
+ *     [{"key":"alfki","name":"Maria (test)","readOnly":true,
+ *       "credentials":{"username":"ALFKI","password":"demo-password-not-real"}}]
  *
  * It logs in a demo user and prints that user's session cookie, so the
  * "host backend" step (POST {mcp}/bind with the wsId + cookie) can be driven
@@ -19,9 +22,14 @@ import { createNorthwindBackend } from './backend.js';
 import { createNorthwindMcp } from './northwind-mcp.js';
 
 const HUB_URL = process.env.HUB_URL ?? 'http://localhost:3333';
-// Default to the local dev admin-token bypass; override with a real diosc_ak_ key.
-const HUB_API_KEY = process.env.HUB_API_KEY ?? 'dev-admin-token-12345';
-const HUB_API_KEY_HEADER = process.env.HUB_API_KEY_HEADER ?? 'x-admin-token';
+// A Hub admin API key scoped `auth:bind` (an Owner creates it in the portal). The Hub's break-glass
+// admin token cannot bind: it is a recovery-only credential and has never held `auth:bind`.
+const HUB_API_KEY = process.env.HUB_API_KEY;
+if (!HUB_API_KEY) {
+  process.stderr.write('HUB_API_KEY is required: a Hub admin API key (diosc_ak_...) scoped auth:bind\n');
+  process.exit(1);
+}
+const HUB_API_KEY_HEADER = process.env.HUB_API_KEY_HEADER ?? 'x-api-key';
 const MCP_PORT = Number(process.env.MCP_PORT ?? 8080);
 const BACKEND_PORT = Number(process.env.BACKEND_PORT ?? 3010);
 const ADMIN_KEY = process.env.MCP_ADMIN_KEY ?? 'northwind-admin-key';

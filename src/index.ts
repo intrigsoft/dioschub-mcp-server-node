@@ -7,11 +7,19 @@ export type {
   CallContext,
   CreateMcpServerConfig,
   HubConfig,
+  PublicTestUser,
+  TestCallContext,
+  TestUserEntry,
+  TestUserEvent,
+  TestUserEventType,
+  TestUserLoginContext,
+  TestUserLoginResult,
+  TestUsersConfig,
   ToolContext,
   ToolDefinition,
 } from './types.js';
 
-export type { HubBinder } from './hub-client.js';
+export type { HubBinder, TestBindDelivery, TestTicketCheck } from './hub-client.js';
 
 export { defaultLogger } from './logger.js';
 export type { Logger } from './logger.js';
@@ -32,7 +40,14 @@ export type {
   RedisIdempotencyStoreOptions,
 } from './idempotency/index.js';
 
-export { HubBindError } from './hub-client.js';
+export { HubBindError, HubTestCallError } from './hub-client.js';
+
+export {
+  DEFAULT_TEST_USERS_ENV,
+  TEST_HANDLE_TTL_SECONDS,
+  TEST_USERS_CAPABILITY,
+  TestUsersConfigError,
+} from './test-users.js';
 
 export { ReauthRequired } from './errors.js';
 

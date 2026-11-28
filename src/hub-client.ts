@@ -12,6 +12,53 @@ import type { Logger } from './logger.js';
  */
 export interface HubBinder {
   bind(connectionId: string, token: string, identity?: BindIdentity | null): Promise<void>;
+  /**
+   * Test users: ask the Hub whether a ticket it sent us is valid
+   * (`POST /api/auth/test-tickets/verify`). Resolves true only for
+   * `{ valid: true }`; throws when the Hub cannot be asked. Optional: a binder
+   * without it (and `testBind`) leaves test users off.
+   */
+  verifyTestTicket?(check: TestTicketCheck, signal?: AbortSignal): Promise<boolean>;
+  /**
+   * Test users: hand the Hub a test handle (`POST /api/auth/test-bind`),
+   * quoting the ticket. Throws on any answer but 2xx. Optional, as above.
+   */
+  testBind?(delivery: TestBindDelivery, signal?: AbortSignal): Promise<void>;
+}
+
+/** Body of a test ticket check, less the `instanceName` the client adds. */
+export interface TestTicketCheck {
+  ticket: string;
+  purpose: 'list' | 'bind';
+  /** Sent with `purpose: 'bind'`: the Hub checks the ticket was issued for this user. */
+  userKey?: string;
+}
+
+/** What the test-bind route hands the Hub. `token` is the test handle. */
+export interface TestBindDelivery {
+  ticket: string;
+  userKey: string;
+  readOnly: boolean;
+  identity: BindIdentity;
+  token: string;
+  /** ISO 8601 expiry of the handle and its stored artifacts. */
+  expiresAt: string;
+}
+
+/**
+ * The Hub refused or failed a test call. Carries the status and the Hub's
+ * `code` when it sent one, never the request (which holds the handle) or the
+ * Hub's whole body.
+ */
+export class HubTestCallError extends Error {
+  constructor(
+    readonly status: number,
+    readonly code: string | undefined,
+    readonly operation: 'verify' | 'test-bind',
+  ) {
+    super(`Hub ${operation} failed with ${status}${code ? ` (${code})` : ''}`);
+    this.name = 'HubTestCallError';
+  }
 }
 
 export class HubBindError extends Error {
@@ -63,6 +110,8 @@ export class HubBindError extends Error {
  */
 export class HubClient implements HubBinder {
   private readonly bindUrl: string;
+  private readonly testVerifyUrl: string;
+  private readonly testBindUrl: string;
   private readonly apiKeyHeader: string;
   private readonly instanceName?: string;
   private warnedUntargeted = false;
@@ -74,6 +123,8 @@ export class HubClient implements HubBinder {
     const base = config.url.replace(/\/+$/, '');
     const path = config.bindPath ?? '/api/auth/bind';
     this.bindUrl = base + path;
+    this.testVerifyUrl = base + (config.testTicketVerifyPath ?? '/api/auth/test-tickets/verify');
+    this.testBindUrl = base + (config.testBindPath ?? '/api/auth/test-bind');
     this.apiKeyHeader = config.apiKeyHeader ?? 'x-api-key';
     this.instanceName = config.instanceName;
   }
@@ -98,6 +149,55 @@ export class HubClient implements HubBinder {
       throw new HubBindError(res.status, body);
     }
     this.logger.debug('hub bind ok', { connectionId, target: this.instanceName ?? null });
+  }
+
+  async verifyTestTicket(check: TestTicketCheck, signal?: AbortSignal): Promise<boolean> {
+    const res = await this.post(
+      this.testVerifyUrl,
+      {
+        ticket: check.ticket,
+        purpose: check.purpose,
+        ...(this.instanceName ? { instanceName: this.instanceName } : {}),
+        ...(check.userKey !== undefined ? { userKey: check.userKey } : {}),
+      },
+      signal,
+    );
+    if (!res.ok) throw new HubTestCallError(res.status, await errorCode(res), 'verify');
+    const body = (await res.json().catch(() => undefined)) as { valid?: unknown } | undefined;
+    if (typeof body?.valid !== 'boolean') {
+      // A 200 without the contract's body (wrong path, a proxy page): fail closed, loudly.
+      throw new HubTestCallError(res.status, 'unexpected_body', 'verify');
+    }
+    return body.valid === true;
+  }
+
+  async testBind(delivery: TestBindDelivery, signal?: AbortSignal): Promise<void> {
+    // Session-wide shape only: the Hub keeps a test handle per admin and server,
+    // so there is no per-target map to fill.
+    const res = await this.post(
+      this.testBindUrl,
+      {
+        ticket: delivery.ticket,
+        ...(this.instanceName ? { instanceName: this.instanceName } : {}),
+        userKey: delivery.userKey,
+        readOnly: delivery.readOnly,
+        identity: delivery.identity,
+        authArtifacts: { headers: { Authorization: `Bearer ${delivery.token}` } },
+        expiresAt: delivery.expiresAt,
+      },
+      signal,
+    );
+    if (!res.ok) throw new HubTestCallError(res.status, await errorCode(res), 'test-bind');
+    this.logger.debug('hub test-bind ok', { testUser: delivery.userKey });
+  }
+
+  private post(url: string, body: unknown, signal?: AbortSignal): Promise<globalThis.Response> {
+    return fetch(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', [this.apiKeyHeader]: this.config.apiKey },
+      body: JSON.stringify(body),
+      ...(signal ? { signal } : {}),
+    });
   }
 
   /**
@@ -127,4 +227,11 @@ export class HubClient implements HubBinder {
       perServer: { [this.instanceName]: { headers: { Authorization: authorization } } },
     };
   }
+}
+
+/** The Hub's `code` field, when its error body is JSON with a short string code. */
+async function errorCode(res: globalThis.Response): Promise<string | undefined> {
+  const body = (await res.json().catch(() => undefined)) as { code?: unknown } | undefined;
+  const code = body?.code;
+  return typeof code === 'string' && /^[A-Za-z0-9_.-]{1,64}$/.test(code) ? code : undefined;
 }

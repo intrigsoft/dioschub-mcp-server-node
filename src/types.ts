@@ -61,6 +61,115 @@ export interface ToolContext<TAuth> {
   logger: Logger;
   /** Aborts when the caller disconnects. Honor at the next boundary (drain-over-abort). */
   signal: AbortSignal;
+  /**
+   * Set only when the call carries a **test** handle (see `testUsers`): which
+   * test user it runs as and whether that user is read only. Absent on every
+   * call with a real handle.
+   */
+  test?: TestCallContext;
+}
+
+/** `ctx.test` on a call made with a test handle. */
+export interface TestCallContext {
+  /** The test user's `key`, as in the test users list. */
+  readonly userKey: string;
+  /** True when the entry is read only: only `readOnlyHint: true` tools run. */
+  readonly readOnly: boolean;
+}
+
+/**
+ * One entry of the test users list (the `DIOSC_TEST_USERS` variable).
+ * `credentials` is the private part: any shape your `login` script needs. It
+ * never leaves this process.
+ */
+export interface TestUserEntry {
+  /** Stable id, `^[a-z0-9][a-z0-9._-]{0,63}$`, unique in the list. */
+  key: string;
+  /** Shown to the admin. 1 to 100 characters. */
+  name: string;
+  /** Shown to the admin. Up to 200 characters. */
+  note?: string;
+  /** Only tools annotated `readOnlyHint: true` run for this user. */
+  readOnly?: boolean;
+  /** The private part, handed only to `login`. */
+  credentials: unknown;
+}
+
+/** The public part of an entry: what the Hub (and the admin) sees. */
+export type PublicTestUser = Omit<TestUserEntry, 'credentials'>;
+
+/** The third argument of `testUsers.login`. */
+export interface TestUserLoginContext {
+  /** Scoped to this test user. Never log `credentials` with it. */
+  logger: Logger;
+  /** Aborts when the Hub hangs up on the test-bind request. */
+  signal: AbortSignal;
+}
+
+/** What `testUsers.login` returns: what a real `/bind` would have carried. */
+export interface TestUserLoginResult<TAuth> {
+  /** The native auth artifacts, stored and replayed into `ctx.auth` as on a real bind. */
+  auth: TAuth;
+  /** The identity the app would assert at bind. */
+  identity: BindIdentity;
+}
+
+export type TestUserEventType =
+  | 'test-login'
+  | 'test-login-failed'
+  | 'test-call'
+  | 'test-call-refused'
+  | 'test-unbind';
+
+/**
+ * Audit event for `testUsers.onEvent`. Never carries credentials or the handle.
+ * `reason` is one of the framework's fixed codes, never an upstream message.
+ */
+export interface TestUserEvent {
+  type: TestUserEventType;
+  userKey: string;
+  /** ISO 8601 time the event happened. */
+  at: string;
+  /** The tool, for `test-call` and `test-call-refused`. */
+  tool?: string;
+  /**
+   * Why, for `test-login-failed` (`unknown_test_user`, `login_failed`,
+   * `invalid_login_result`, `store_failed`, `hub_delivery_failed`) and
+   * `test-call-refused` (`read_only`).
+   */
+  reason?: string;
+}
+
+/**
+ * Test users: accounts the Hub's admin can sign in as, to test this server's
+ * tools as a real user would. See the README section "Test users".
+ */
+export interface TestUsersConfig<TAuth> {
+  /**
+   * The list, as JSON text or already parsed. Default: `process.env[env]`.
+   * Unset, empty, or `[]`: the feature is off.
+   */
+  users?: string | TestUserEntry[];
+  /** Name of the environment variable holding the list. Default `DIOSC_TEST_USERS`. */
+  env?: string;
+  /**
+   * Your script: sign in to the real auth service with the entry's
+   * `credentials`. Throw when the sign-in fails; the error is not logged or
+   * sent anywhere (the Hub gets `test_login_failed`), so log what you need
+   * yourself, without the credentials.
+   */
+  login(
+    credentials: unknown,
+    entry: PublicTestUser,
+    ctx: TestUserLoginContext,
+  ): Promise<TestUserLoginResult<TAuth>>;
+  /** Optional audit hook. A hook that throws or rejects is logged and ignored. */
+  onEvent?(event: TestUserEvent): void | Promise<void>;
+  /**
+   * Attempts allowed on the two ticket routes (`test-users`, `test-bind`)
+   * together, per minute, per process. Default 30.
+   */
+  rateLimitPerMinute?: number;
 }
 
 /** A tool the concrete MCP server registers. */
@@ -106,6 +215,10 @@ export interface HubConfig {
   apiKey: string;
   /** Override the Hub bind path. Default: `/api/auth/bind`. */
   bindPath?: string;
+  /** Override the Hub's test ticket check path. Default: `/api/auth/test-tickets/verify`. */
+  testTicketVerifyPath?: string;
+  /** Override the Hub's test bind path. Default: `/api/auth/test-bind`. */
+  testBindPath?: string;
   /** Header the Hub expects the API key in. Default: `x-api-key`. */
   apiKeyHeader?: string;
   /**
@@ -184,4 +297,13 @@ export interface CreateMcpServerConfig<TAuth> {
    * for more than one replica.
    */
   idempotency?: false | IdempotencyConfig;
+
+  /**
+   * Test users the Hub's admin can sign in as (off by default). On only when
+   * this is set, the list has at least one entry, and the Hub client can make
+   * the test calls (`hub` config, or a `hubClient` with `verifyTestTicket` and
+   * `testBind`). The list is checked at start-up; a bad list throws
+   * `TestUsersConfigError`. See the README section "Test users".
+   */
+  testUsers?: TestUsersConfig<TAuth>;
 }

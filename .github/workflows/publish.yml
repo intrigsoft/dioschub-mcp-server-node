@@ -1,12 +1,18 @@
 name: Publish
 
-# What is on the `production` branch is what is published. Bump the version on
-# `main`, merge to `production`, and CI publishes it. Re-pushing production
-# without a version bump is a safe no-op (the guard below skips the publish).
+# A version bump merged to `main` is published. Every push to `main` runs this;
+# the guard below skips the publish when that exact version is already on npm,
+# so ordinary merges (no bump) are a no-op. `production` still works the same
+# way for anyone who prefers to release from it.
 on:
   push:
-    branches: [production]
+    branches: [main, production]
   workflow_dispatch:
+
+# Two pushes in a row never publish the same version twice in parallel.
+concurrency:
+  group: publish
+  cancel-in-progress: false
 
 jobs:
   publish:
